@@ -1,8 +1,11 @@
 package Mojo::DynamicMethods;
 use Mojo::Base -strict;
 
-use Hash::Util::FieldHash qw(fieldhash);
+use Hash::Util::FieldHash qw(fieldhash id_2obj);
 use Mojo::Util            qw(monkey_patch);
+
+our (%DYN_METHODS, %PLAIN_METHODS, %INSTALLED, $FROZEN_MODE);
+my $SETUP;
 
 sub import {
   my ($flag, $caller) = ($_[1] // '', caller);
@@ -27,16 +30,48 @@ sub import {
   }
 }
 
+sub prepare_for_freeze {
+  return if $FROZEN_MODE;
+  $FROZEN_MODE = 1;
+
+  # Drain fieldhash cleanly (removing all weakref backrefs) into a plain worker-safe hash
+  for my $id (keys %DYN_METHODS) {
+    my $methods = delete $DYN_METHODS{$id};
+    my $obj     = id_2obj($id);
+    $PLAIN_METHODS{$obj} = $methods if defined $obj;
+  }
+  if (defined &Hash::Util::FieldHash::_ob_reg) {
+    %{Hash::Util::FieldHash::_ob_reg()} = ();
+  }
+
+  # Rebind installed dynamic dispatchers to the plain hash
+  for my $target (keys %INSTALLED) {
+    my $dyn_pkg = "${target}::_Dynamic";
+    for my $name (keys %{$INSTALLED{$target}}) {
+      monkey_patch($dyn_pkg, $name, $target->BUILD_DYNAMIC($name, \%PLAIN_METHODS));
+    }
+  }
+}
+
 sub register {
   my ($target, $object, $name, $code) = @_;
 
-  state %dyn_methods;
-  state $setup = do { fieldhash %dyn_methods; 1 };
+  if ($FROZEN_MODE) {
+    my $dyn_pkg = "${target}::_Dynamic";
+    monkey_patch($dyn_pkg, $name, $target->BUILD_DYNAMIC($name, \%PLAIN_METHODS))
+      unless do { no strict 'refs'; *{"${dyn_pkg}::${name}"}{CODE} };
+    $PLAIN_METHODS{$object}{$name} = $code;
+    $INSTALLED{$target}{$name}     = 1;
+    return;
+  }
+
+  $SETUP ||= do { fieldhash %DYN_METHODS; 1 };
 
   my $dyn_pkg = "${target}::_Dynamic";
-  monkey_patch($dyn_pkg, $name, $target->BUILD_DYNAMIC($name, \%dyn_methods))
+  monkey_patch($dyn_pkg, $name, $target->BUILD_DYNAMIC($name, \%DYN_METHODS))
     unless do { no strict 'refs'; *{"${dyn_pkg}::${name}"}{CODE} };
-  $dyn_methods{$object}{$name} = $code;
+  $DYN_METHODS{$object}{$name} = $code;
+  $INSTALLED{$target}{$name}   = 1;
 }
 
 "Ph'nglui mglw'nafh Cthulhu R'lyeh wgah'nagl fhtagn";

@@ -7,15 +7,16 @@ use Scalar::Util qw(weaken);
 
 has ioloop => sub { Mojo::IOLoop->singleton };
 
+our $SINGLETON;
+
 sub app {
   my ($self, $app) = @_;
 
   # Singleton application
-  state $singleton;
-  return $singleton = $app ? $app : $singleton unless ref $self;
+  return $SINGLETON = $app ? $app : $SINGLETON unless ref $self;
 
   # Default to singleton application
-  return $self->{app} || $singleton unless $app;
+  return $self->{app} || $SINGLETON unless $app;
   $self->{app} = $app;
   return $self;
 }

@@ -19,6 +19,23 @@ use constant ASYNC => $ENV{MOJO_NO_ASYNC}
   ? 0
   : !!(eval { require Future::AsyncAwait; Future::AsyncAwait->VERSION('0.52'); 1 });
 
+# perl5-mt runtime detection (avoid circular use of Mojo::MT)
+use constant HAS_MT => $ENV{MOJO_NO_MT} ? 0 : (defined &MT::Image::freeze ? 1 : 0);
+
+# Worker-isolated weak attribute registry (safe across MT::Image::freeze)
+our %WEAK_NAMES;
+
+sub _weaken {
+  return unless ref $_[0];
+  if (HAS_MT) {
+    my $rt = Scalar::Util::reftype($_[0]);
+    return if ($rt eq 'HASH'  && Internals::SvREADONLY(%{$_[0]}))
+           || ($rt eq 'ARRAY' && Internals::SvREADONLY(@{$_[0]}))
+           || ($rt eq 'SCALAR' && Internals::SvREADONLY(${$_[0]}));
+  }
+  Scalar::Util::weaken($_[0]);
+}
+
 # Protect subclasses using AUTOLOAD
 sub DESTROY { }
 
@@ -31,19 +48,23 @@ sub attr {
 
   # Weaken
   if ($kv{weak}) {
-    state %weak_names;
-    unless ($weak_names{$class}) {
-      my $names = $weak_names{$class} = [];
+    unless ($WEAK_NAMES{$class}) {
+      my $names = $WEAK_NAMES{$class} = [];
       my $sub   = sub {
         my $self = shift->next::method(@_);
-        ref $self->{$_} and Scalar::Util::weaken $self->{$_} for @$names;
+        if (HAS_MT) {
+          ref $self->{$_} and _weaken($self->{$_}) for @$names;
+        }
+        else {
+          ref $self->{$_} and Scalar::Util::weaken $self->{$_} for @$names;
+        }
         return $self;
       };
       Mojo::BaseUtil::monkey_patch(my $base = $class . '::_Base', 'new', $sub);
       no strict 'refs';
       unshift @{"${class}::ISA"}, $base;
     }
-    push @{$weak_names{$class}}, ref $attrs eq 'ARRAY' ? @$attrs : $attrs;
+    push @{$WEAK_NAMES{$class}}, ref $attrs eq 'ARRAY' ? @$attrs : $attrs;
   }
 
   for my $attr (@{ref $attrs eq 'ARRAY' ? $attrs : [$attrs]}) {
@@ -53,22 +74,38 @@ sub attr {
     my $sub;
     if ($kv{weak}) {
       if (ref $value) {
-        $sub = sub {
-          return
-            exists $_[0]{$attr}
-            ? $_[0]{$attr}
-            : (ref($_[0]{$attr} = $value->($_[0])) && Scalar::Util::weaken($_[0]{$attr}), $_[0]{$attr})
-            if @_ == 1;
-          ref($_[0]{$attr} = $_[1]) and Scalar::Util::weaken($_[0]{$attr});
-          $_[0];
-        };
+        $sub = HAS_MT
+          ? sub {
+            return
+              exists $_[0]{$attr}
+              ? $_[0]{$attr}
+              : (ref($_[0]{$attr} = $value->($_[0])) && _weaken($_[0]{$attr}), $_[0]{$attr})
+              if @_ == 1;
+            ref($_[0]{$attr} = $_[1]) and _weaken($_[0]{$attr});
+            $_[0];
+          }
+          : sub {
+            return
+              exists $_[0]{$attr}
+              ? $_[0]{$attr}
+              : (ref($_[0]{$attr} = $value->($_[0])) && Scalar::Util::weaken($_[0]{$attr}), $_[0]{$attr})
+              if @_ == 1;
+            ref($_[0]{$attr} = $_[1]) and Scalar::Util::weaken($_[0]{$attr});
+            $_[0];
+          };
       }
       else {
-        $sub = sub {
-          return $_[0]{$attr} if @_ == 1;
-          ref($_[0]{$attr} = $_[1]) and Scalar::Util::weaken($_[0]{$attr});
-          $_[0];
-        };
+        $sub = HAS_MT
+          ? sub {
+            return $_[0]{$attr} if @_ == 1;
+            ref($_[0]{$attr} = $_[1]) and _weaken($_[0]{$attr});
+            $_[0];
+          }
+          : sub {
+            return $_[0]{$attr} if @_ == 1;
+            ref($_[0]{$attr} = $_[1]) and Scalar::Util::weaken($_[0]{$attr});
+            $_[0];
+          };
       }
     }
     elsif (ref $value) {

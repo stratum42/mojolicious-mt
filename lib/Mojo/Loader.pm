@@ -8,7 +8,7 @@ use Mojo::Util qw(b64_decode class_to_path deprecated);
 
 our @EXPORT_OK = qw(data_section file_is_binary find_modules find_packages load_class load_classes);
 
-my (%BIN, %CACHE);
+our (%BIN, %CACHE);
 
 sub data_section { $_[0] ? $_[1] ? _all($_[0])->{$_[1]} : _all($_[0]) : undef }
 

@@ -11,7 +11,7 @@ use Socket       qw(IPPROTO_TCP SOCK_STREAM TCP_NODELAY);
 
 # Non-blocking name resolution requires Net::DNS::Native
 use constant NNR => $ENV{MOJO_NO_NNR} ? 0 : !!eval { require Net::DNS::Native; Net::DNS::Native->VERSION('0.15'); 1 };
-my $NDN;
+our $NDN;
 
 # SOCKS support requires IO::Socket::Socks
 use constant SOCKS => $ENV{MOJO_NO_SOCKS}

@@ -14,6 +14,9 @@ use Scalar::Util qw(blessed weaken);
 
 use constant DEBUG => $ENV{MOJO_IOLOOP_DEBUG} || 0;
 
+# Worker-isolated singleton and freeze slots (safe across MT::Image::freeze)
+our ($SINGLETON, @FROZEN);
+
 has max_accepts     => 0;
 has max_connections => 1000;
 has reactor         => sub {
@@ -92,13 +95,18 @@ sub reset {
 
   $self->emit('reset')->stop;
   if ($options->{freeze}) {
-    state @frozen;
-    push @frozen, {%$self};
+    push @FROZEN, {%$self};
     delete $self->{reactor};
   }
   else { $self->reactor->reset }
 
   delete @$self{qw(accepting acceptors events in out stop)};
+}
+
+sub reset_singleton {
+  my $class = shift;
+  undef $SINGLETON;
+  return $class;
 }
 
 sub server {
@@ -126,7 +134,7 @@ sub server {
   return $self->acceptor($server);
 }
 
-sub singleton { state $loop = shift->new }
+sub singleton { $SINGLETON //= shift->new }
 
 sub start {
   my $self = _instance(shift);
@@ -435,6 +443,14 @@ Freeze the current state of the event loop in time before resetting it. This wil
 getting closed immediately, which can help with many unintended side effects when processes are forked.
 
 =back
+
+=head2 reset_singleton
+
+  Mojo::IOLoop->reset_singleton;
+
+Clear the global L</"singleton"> slot so the next call to L</"singleton">
+creates a fresh event loop and reactor. Used before C<MT::Image::freeze()> under
+C<perl5-mt> so each worker thread initializes its own isolated event loop.
 
 =head2 server
 
