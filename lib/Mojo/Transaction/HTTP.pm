@@ -1,7 +1,14 @@
 package Mojo::Transaction::HTTP;
 use Mojo::Base 'Mojo::Transaction';
 
+use Mojo::Date;
+use Mojo::MT qw(HAS_MT_ACCEL);
+
 has 'previous';
+
+# Per-second cached HTTP Date header (our-scoped for perl5-mt worker isolation)
+our $DATE_EPOCH = -1;
+our $DATE_STR   = '';
 
 sub client_read {
   my ($self, $chunk) = @_;
@@ -28,13 +35,20 @@ sub keep_alive {
   # Close
   my $req      = $self->req;
   my $res      = $self->res;
-  my $req_conn = lc($req->headers->connection // '');
-  my $res_conn = lc($res->headers->connection // '');
-  return undef if $req_conn eq 'close' || $res_conn eq 'close';
+  my $req_conn = $req->headers->connection;
+  my $res_conn = $res->headers->connection;
+  if (defined $req_conn) {
+    $req_conn = lc $req_conn;
+    return undef if $req_conn eq 'close';
+  }
+  if (defined $res_conn) {
+    $res_conn = lc $res_conn;
+    return undef if $res_conn eq 'close';
+  }
 
   # Keep-alive is optional for 1.0
-  return $res_conn eq 'keep-alive' if $res->version eq '1.0';
-  return $req_conn eq 'keep-alive' if $req->version eq '1.0';
+  return ($res_conn // '') eq 'keep-alive' if $res->version eq '1.0';
+  return ($req_conn // '') eq 'keep-alive' if $req->version eq '1.0';
 
   # Keep-alive is the default for 1.1
   return 1;
@@ -60,7 +74,64 @@ sub server_read {
   $self->emit('request') if $req->is_finished && !$self->{handled}++;
 }
 
-sub server_write { shift->_write(1) }
+sub server_write {
+  my $self = shift;
+  return '' unless $self->{writing};
+
+  # Single-shot C/XS HTTP/1.1 response serializer fast path
+  if (HAS_MT_ACCEL && !$self->{http_state}) {
+    my $res     = $self->res;
+    my $content = $res->{content};
+    if ($content && ref($content) eq 'Mojo::Content::Single'
+     && !$content->{dynamic} && !$res->{fix} && !defined($res->{start_buffer})
+     && !($res->{events} && $res->{events}{progress}))
+    {
+      my $code = $res->{code} || 404;
+      my $req  = $self->{req};
+      my $meth = $req && $req->{method};
+      if ($code >= 200 && $code != 204 && $code != 304 && (!defined $meth || uc($meth) ne 'HEAD')) {
+        my $headers = $content->{headers};
+        my $hdrs_hv = $headers && $headers->{headers};
+        if (!$hdrs_hv || !$hdrs_hv->{'transfer-encoding'}) {
+          my $asset = $content->{asset};
+          if (!$asset || (ref($asset) eq 'Mojo::Asset::Memory'
+           && !defined($asset->{start_range}) && !defined($asset->{end_range})
+           && length($asset->{content} // '') <= 131072))
+          {
+            my $body = $asset ? ($asset->{content} // '') : '';
+            $headers ||= $content->headers;
+            $hdrs_hv = $headers->{headers} ||= {};
+            my $date_str;
+            if (!$hdrs_hv->{date}) {
+              my $now = int time;
+              if ($now != $DATE_EPOCH) {
+                $DATE_EPOCH = $now;
+                $DATE_STR   = Mojo::Date->new($now)->to_string;
+              }
+              $date_str = $DATE_STR;
+              $hdrs_hv->{date} = [$date_str];
+            }
+            $hdrs_hv->{'content-length'} = [length $body] unless $hdrs_hv->{'content-length'};
+
+            my $wire = Mojo::MT::Accel::build_http_response(
+              $code, $res->{message}, $hdrs_hv, $body, undef, 1, $headers->{names}, $res->{version}
+            );
+            if (defined $wire) {
+              $res->{fix}   = 1;
+              $res->{state} = 'finished';
+              $res->emit('finish') if !$res->{finished}++ && $res->{events} && $res->{events}{finish};
+              @$self{qw(http_state offset write)} = ('body', length($body), 0);
+              $self->completed;
+              return $wire;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return $self->_write(1);
+}
 
 sub _body {
   my ($self, $msg, $finish) = @_;
@@ -123,9 +194,23 @@ sub _write {
   return '' unless $server ? $self->{writing} : ($self->{writing} //= 1);
 
   # Nothing written yet
-  $self->{$_} ||= 0 for qw(offset write);
+  $self->{offset} ||= 0;
+  $self->{write}  ||= 0;
   my $msg = $server ? $self->res : $self->req;
-  @$self{qw(http_state write)} = ('start_line', $msg->start_line_size) unless $self->{http_state};
+  if (!$self->{http_state}) {
+    if ($server) {
+      my $headers = $msg->headers;
+      if (!$headers->date) {
+        my $now = int time;
+        if ($now != $DATE_EPOCH) {
+          $DATE_EPOCH = $now;
+          $DATE_STR   = Mojo::Date->new($now)->to_string;
+        }
+        $headers->date($DATE_STR);
+      }
+    }
+    @$self{qw(http_state write)} = ('start_line', $msg->start_line_size);
+  }
 
   # Start-line
   my $chunk = '';

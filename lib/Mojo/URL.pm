@@ -52,6 +52,14 @@ sub new { @_ > 1 ? shift->SUPER::new->parse(@_) : shift->SUPER::new }
 sub parse {
   my ($self, $url) = @_;
 
+  # Fast path for simple origin-form paths (e.g. "/plaintext", "/static/payload.txt")
+  if (defined $url && substr($url, 0, 1) eq '/' && substr($url, 1, 1) ne '/'
+   && index($url, '?') < 0 && index($url, '#') < 0)
+  {
+    $self->{path} ? $self->{path}->parse($url) : ($self->{path} = bless({path => $url}, 'Mojo::Path'));
+    return $self;
+  }
+
   # Official regex from RFC 3986
   $url =~ m!^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?!;
   $self->scheme($2)                         if defined $2;

@@ -73,7 +73,16 @@ sub to_dir {
 }
 
 sub to_route {
-  my $clone = shift->clone;
+  my $self = shift;
+  if (!$self->{parts} && !exists($self->{charset})) {
+    my $path = $self->{path};
+    if (defined $path && !ref($path) && substr($path, 0, 1) eq '/' && $path ne '//'
+     && index($path, '%') < 0 && ($path =~ tr/\x00-\x7f//c) == 0)
+    {
+      return $path;
+    }
+  }
+  my $clone = $self->clone;
   return '/' . join '/', @{$clone->parts}, $clone->trailing_slash ? '' : ();
 }
 
@@ -102,12 +111,20 @@ sub _parse {
   my ($self, $name) = (shift, shift);
 
   unless ($self->{parts}) {
-    my $path    = url_unescape delete($self->{path}) // '';
-    my $charset = $self->charset;
-    $path                   = decode($charset, $path) // $path if $charset;
-    $self->{leading_slash}  = $path =~ s!^/!!;
-    $self->{trailing_slash} = $path =~ s!/$!!;
-    $self->{parts}          = [split /\//, $path, -1];
+    my $raw = delete($self->{path});
+    if (defined $raw && !ref($raw) && !exists($self->{charset}) && index($raw, '%') < 0 && ($raw =~ tr/\x00-\x7f//c) == 0) {
+      $self->{leading_slash}  = substr($raw, 0, 1) eq '/' ? (substr($raw, 0, 1, ''), 1) : '';
+      $self->{trailing_slash} = length($raw) && substr($raw, -1) eq '/' ? (substr($raw, -1, 1, ''), 1) : '';
+      $self->{parts}          = [split /\//, $raw, -1];
+    }
+    else {
+      my $path    = url_unescape $raw // '';
+      my $charset = $self->charset;
+      $path                   = decode($charset, $path) // $path if $charset;
+      $self->{leading_slash}  = $path =~ s!^/!!;
+      $self->{trailing_slash} = $path =~ s!/$!!;
+      $self->{parts}          = [split /\//, $path, -1];
+    }
   }
 
   return $self->{$name} unless @_;

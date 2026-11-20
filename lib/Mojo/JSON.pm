@@ -4,6 +4,7 @@ use Mojo::Base -strict;
 use Carp         qw(croak);
 use Exporter     qw(import);
 use JSON::PP     ();
+use Mojo::MT     qw(HAS_MT_ACCEL);
 use Mojo::Util   qw(decode encode monkey_patch);
 use overload     ();
 use Scalar::Util qw(blessed);
@@ -36,8 +37,28 @@ my %ESCAPE
 my %REVERSE = map { $ESCAPE{$_} => "\\$_" } keys %ESCAPE;
 for (0x00 .. 0x1f) { $REVERSE{pack 'C', $_} //= sprintf '\u%.4X', $_ }
 
-# Replace pure-Perl fallbacks if Cpanel::JSON::XS is available
-if (JSON_XS) {
+# Replace pure-Perl fallbacks with Tier-1 C/NEON accelerator or Cpanel::JSON::XS
+if (HAS_MT_ACCEL) {
+  monkey_patch __PACKAGE__, 'encode_json', sub {
+    Mojo::MT::Accel::json_encode($_[0], 1) // encode('UTF-8', _encode_value($_[0]));
+  };
+  monkey_patch __PACKAGE__, 'decode_json', sub {
+    my $val;
+    return $val if Mojo::MT::Accel::json_decode($_[0], 0, \$val);
+    my $err = _decode(\$val, $_[0]);
+    return defined $err ? croak $err : $val;
+  };
+  monkey_patch __PACKAGE__, 'to_json', sub {
+    Mojo::MT::Accel::json_encode($_[0], 0) // _encode_value($_[0]);
+  };
+  monkey_patch __PACKAGE__, 'from_json', sub {
+    my $val;
+    return $val if Mojo::MT::Accel::json_decode($_[0], 1, \$val);
+    my $err = _decode(\$val, $_[0], 1);
+    return defined $err ? croak $err : $val;
+  };
+}
+elsif (JSON_XS) {
   my $BINARY = Cpanel::JSON::XS->new->utf8;
   my $TEXT   = Cpanel::JSON::XS->new;
   $_->canonical->allow_nonref->allow_unknown->allow_blessed->convert_blessed->stringify_infnan->escape_slash

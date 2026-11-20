@@ -27,9 +27,11 @@ sub get_body_chunk {
   return $self->asset->get_chunk($offset);
 }
 
+my $_READ_CB = sub { $_[0]->asset($_[0]->asset->add_chunk($_[1])) };
+
 sub new {
   my $self = shift->SUPER::new(@_);
-  $self->{read} = $self->on(read => sub { $_[0]->asset($_[0]->asset->add_chunk($_[1])) });
+  $self->{read} = $self->on(read => $_READ_CB);
   return $self;
 }
 

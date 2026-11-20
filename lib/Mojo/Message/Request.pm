@@ -3,16 +3,20 @@ use Mojo::Base 'Mojo::Message';
 
 use Digest::SHA qw(sha1_base64);
 use Mojo::Cookie::Request;
+use Mojo::MT   qw(HAS_MT_ACCEL);
 use Mojo::Util qw(b64_encode b64_decode sha1_sum url_unescape);
 use Mojo::URL;
+
+# Worker-isolated request_id state (safe across MT::Image::freeze)
+our ($REQUEST_ID_SEED, $REQUEST_ID_COUNTER);
 
 has env    => sub { {} };
 has method => 'GET';
 has [qw(proxy reverse_proxy)];
 has request_id => sub {
-  state $seed    = $$ . time . rand;
-  state $counter = int rand 0xffffff;
-  my $b64 = substr(sha1_base64($seed . ($counter = ($counter + 1) % 0xffffff)), 0, 12);
+  $REQUEST_ID_SEED    //= $$ . time . rand;
+  $REQUEST_ID_COUNTER //= int rand 0xffffff;
+  my $b64 = substr(sha1_base64($REQUEST_ID_SEED . ($REQUEST_ID_COUNTER = ($REQUEST_ID_COUNTER + 1) % 0xffffff)), 0, 12);
   $b64 =~ tr!+/!-_!;
   return $b64;
 };
@@ -50,6 +54,22 @@ sub every_param { shift->params->every_param(@_) }
 
 sub extract_start_line {
   my ($self, $bufref) = @_;
+
+  if (HAS_MT_ACCEL) {
+    my ($consumed, $method, $target, $version) = Mojo::MT::Accel::http_parse_start_line($$bufref);
+    if ($consumed >= 0) {
+      substr $$bufref, 0, $consumed, '';
+      my $url = $self->method($method)->version($version)->url;
+      return !!$url->host_port($target)              if $method eq 'CONNECT';
+      return !!$url->parse($target)->fragment(undef) if $target =~ /^[^:\/?#]+:/;
+      return !!$url->path_query($target);
+    }
+    if ($consumed == -2) {
+      $$bufref =~ s/^\s*(.*?)\x0d?\x0a//;
+      return !$self->error({message => 'Bad request start-line'});
+    }
+    return undef unless utf8::is_utf8($$bufref);
+  }
 
   # Ignore any leading empty lines
   return undef unless $$bufref =~ s/^\s*(.*?)\x0d?\x0a//;

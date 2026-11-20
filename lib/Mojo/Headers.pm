@@ -2,6 +2,7 @@ package Mojo::Headers;
 use Mojo::Base -base;
 
 use Carp       qw(croak);
+use Mojo::MT   qw(HAS_MT_ACCEL);
 use Mojo::Util qw(header_params monkey_patch);
 
 has max_line_size => sub { $ENV{MOJO_MAX_LINE_SIZE} || 8192 };
@@ -126,6 +127,22 @@ sub parse {
 
   $self->{state} = 'headers';
   $self->{buffer} .= $chunk;
+
+  if (HAS_MT_ACCEL && !($self->{cache} && @{$self->{cache}})) {
+    my $consumed = Mojo::MT::Accel::http_parse_headers(
+      $self->{headers} //= {},
+      $self->{names}   //= {},
+      $self->{buffer},
+      $self->max_line_size,
+      $self->max_lines
+    );
+    if ($consumed >= 0) {
+      substr $self->{buffer}, 0, $consumed, '';
+      @$self{qw(state cache)} = ('finished', []);
+      return $self;
+    }
+  }
+
   my $headers = $self->{cache} //= [];
   my $size    = $self->max_line_size;
   my $lines   = $self->max_lines;

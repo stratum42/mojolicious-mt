@@ -4,13 +4,14 @@ use Mojo::Base 'Mojo::EventEmitter';
 use Carp qw(croak);
 use Config;
 use Mojo::Loader qw(load_class);
+use Mojo::MT     qw(HAS_MT_ACCEL);
 
-my %DETECTED;
+our %DETECTED;
 
 sub again { croak 'Method "again" not implemented by subclass' }
 
 sub detect {
-  my $default = 'Mojo::Reactor::' . ($Config{d_pseudofork} ? 'Poll' : 'EV');
+  my $default = HAS_MT_ACCEL ? 'Mojo::Reactor::MT' : 'Mojo::Reactor::' . ($Config{d_pseudofork} ? 'Poll' : 'EV');
   my $try     = $ENV{MOJO_REACTOR} || $default;
   return $DETECTED{$try} ||= load_class($try) ? 'Mojo::Reactor::Poll' : $try;
 }

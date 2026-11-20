@@ -90,8 +90,10 @@ sub write {
   my ($self, $chunk, $cb) = @_;
 
   # IO::Socket::SSL will corrupt data with the wrong internal representation
-  utf8::downgrade $chunk;
-  $self->{buffer} .= $chunk;
+  $chunk //= '';
+  utf8::downgrade $chunk if utf8::is_utf8($chunk);
+  if (defined $self->{buffer} && length $self->{buffer}) { $self->{buffer} .= $chunk }
+  else                                                   { $self->{buffer}  = $chunk }
   if    ($cb)                     { $self->once(drain => $cb) }
   elsif (!length $self->{buffer}) { return $self }
   $self->reactor->watch($self->{handle}, !$self->{paused}, 1) if $self->{handle};
@@ -100,6 +102,26 @@ sub write {
 }
 
 sub _again { $_[0]->reactor->again($_[0]{timer}) if $_[0]{timer} }
+
+sub _write_now {
+  my ($self, $chunk, $cb) = @_;
+  if ($self->{handle} && !(defined $self->{buffer} && length $self->{buffer})
+   && !($self->{events} && ($self->{events}{write} || $self->{events}{drain})))
+  {
+    utf8::downgrade $chunk if utf8::is_utf8($chunk);
+    my $written = $self->{handle}->syswrite($chunk);
+    if (defined $written && $written == length $chunk) {
+      $self->{written} += $written;
+      $cb->($self) if $cb;
+      return $self;
+    }
+    if (defined $written && $written > 0) {
+      $self->{written} += $written;
+      $chunk = substr($chunk, $written);
+    }
+  }
+  return $self->write($chunk => $cb);
+}
 
 sub _read {
   my $self = shift;
@@ -121,14 +143,21 @@ sub _write {
 
   # Handle errors only when reading (to avoid timing problems)
   my $handle = $self->{handle};
-  if (length $self->{buffer}) {
+  if (defined $self->{buffer} && length $self->{buffer}) {
     return undef unless defined(my $written = $handle->syswrite($self->{buffer}));
     $self->{written} += $written;
-    $self->emit(write => substr($self->{buffer}, 0, $written, ''))->_again;
+    if ($self->{events} && $self->{events}{write}) {
+      $self->emit(write => substr($self->{buffer}, 0, $written, ''))->_again;
+    }
+    else {
+      if ($written == length $self->{buffer}) { undef $self->{buffer} }
+      else                                    { substr($self->{buffer}, 0, $written, '') }
+      $self->_again;
+    }
   }
 
   # Clear the buffer to free the underlying SV* memory
-  undef $self->{buffer}, $self->emit('drain') unless length $self->{buffer};
+  undef $self->{buffer}, $self->emit('drain') unless defined $self->{buffer} && length $self->{buffer};
   return undef                                        if $self->is_writing;
   return $self->close                                 if $self->{graceful};
   $self->reactor->watch($handle, !$self->{paused}, 0) if $self->{handle};

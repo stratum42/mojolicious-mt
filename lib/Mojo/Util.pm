@@ -16,6 +16,7 @@ use IO::Uncompress::Gunzip;
 use List::Util         qw(min);
 use MIME::Base64       qw(decode_base64 encode_base64 encode_base64url);
 use Mojo::BaseUtil     qw(class_to_path monkey_patch);
+use Mojo::MT           qw(HAS_MT_ACCEL);
 use Pod::Usage         qw(pod2usage);
 use Socket             qw(inet_pton AF_INET6 AF_INET);
 use Symbol             qw(delete_package);
@@ -108,8 +109,8 @@ my $UNQUOTED_VALUE_RE = qr/\G=\s*([^;, ]*)/;
 # HTML entities
 my $ENTITY_RE = qr/&(?:\#((?:[0-9]{1,7}|x[0-9a-fA-F]{1,6}));|(\w+[;=]?))/;
 
-# Encoding, encryption and pattern caches
-my (%ENCODING, %ENCRYPTION, %PATTERN);
+# Encoding, encryption and pattern caches (worker-isolated across MT::Image::freeze)
+our (%ENCODING, %ENCRYPTION, %PATTERN);
 
 our @EXPORT_OK = (
   qw(b64_decode b64_encode camelize class_to_file class_to_path decamelize decode decrypt_cookie deprecated dumper),
@@ -120,8 +121,17 @@ our @EXPORT_OK = (
 );
 
 # Aliases
-monkey_patch(__PACKAGE__, 'b64_decode',    \&decode_base64);
-monkey_patch(__PACKAGE__, 'b64_encode',    \&encode_base64);
+monkey_patch(__PACKAGE__, 'b64_decode', HAS_MT_ACCEL ? \&Mojo::MT::Accel::b64_decode : \&decode_base64);
+monkey_patch(
+  __PACKAGE__,
+  'b64_encode',
+  HAS_MT_ACCEL
+  ? sub {
+    my $res = @_ > 1 ? Mojo::MT::Accel::b64_encode($_[0], $_[1]) : Mojo::MT::Accel::b64_encode($_[0]);
+    return defined $res ? $res : &encode_base64;
+  }
+  : \&encode_base64
+);
 monkey_patch(__PACKAGE__, 'hmac_sha1_sum', \&hmac_sha1_hex);
 monkey_patch(__PACKAGE__, 'md5_bytes',     \&md5);
 monkey_patch(__PACKAGE__, 'md5_sum',       \&md5_hex);
@@ -495,6 +505,11 @@ sub url_escape {
     }
     $PATTERN{$pattern}->($str);
   }
+  elsif (HAS_MT_ACCEL) {
+    my $res = Mojo::MT::Accel::url_escape($str);
+    return $res if defined $res;
+    $str =~ s/([^A-Za-z0-9\-._~])/sprintf '%%%02X', ord $1/ge;
+  }
   else { $str =~ s/([^A-Za-z0-9\-._~])/sprintf '%%%02X', ord $1/ge }
 
   return $str;
@@ -631,6 +646,12 @@ sub _teardown {
   no strict 'refs';
   @{"${class}::ISA"} = ();
   delete_package $class;
+}
+
+# Tier-1 C/NEON hot-path overrides when Mojo::MT::Accel is loaded
+if (HAS_MT_ACCEL) {
+  monkey_patch(__PACKAGE__, 'xml_escape',   \&Mojo::MT::Accel::xml_escape);
+  monkey_patch(__PACKAGE__, 'url_unescape', \&Mojo::MT::Accel::url_unescape);
 }
 
 package Mojo::Util::_Guard;
