@@ -5,6 +5,14 @@ use Carp                  qw(croak);
 use Fcntl                 qw(SEEK_SET);
 use File::Spec::Functions ();
 use Mojo::File            qw(tempfile);
+use Mojo::MT              qw(HAS_MT_ASYNC_IO);
+
+use constant USE_MT_ASYNC_IO   => HAS_MT_ASYNC_IO && ($^O eq 'linux');
+use constant ASYNC_IO_MIN_SIZE => 262144;
+
+BEGIN {
+  require MT::IO if HAS_MT_ASYNC_IO;
+}
 
 has [qw(cleanup path)];
 has handle => sub {
@@ -29,6 +37,7 @@ has tmpdir => sub { $ENV{MOJO_TMPDIR} || File::Spec::Functions::tmpdir };
 sub DESTROY {
   my $self = shift;
 
+  if (my $afh = delete $self->{_async_handle}) { close $afh }
   return unless $self->cleanup && defined(my $path = $self->path);
   if (my $handle = $self->handle) { close $handle }
 
@@ -38,6 +47,7 @@ sub DESTROY {
 
 sub add_chunk {
   my ($self, $chunk) = @_;
+  if (my $afh = delete $self->{_async_handle}) { close $afh }
   ($self->handle->syswrite($chunk) // -1) == length $chunk or croak "Can't write to asset: $!";
   return $self;
 }
@@ -81,6 +91,27 @@ sub get_chunk {
   $max //= 131072;
 
   $offset += $self->start_range;
+
+  if (HAS_MT_ASYNC_IO && !$self->{handle} && !$self->{cleanup} && defined(my $path = $self->{path})) {
+    my $use_async = USE_MT_ASYNC_IO || $self->{_async_handle} || (($self->size // 0) >= ASYNC_IO_MIN_SIZE);
+    if ($use_async) {
+      my $afh = $self->{_async_handle};
+      if (!$afh) {
+        open $afh, '<:async', $path and $self->{_async_handle} = $afh;
+      }
+      if ($afh) {
+        seek $afh, $offset, SEEK_SET;
+        my $buffer = '';
+        if (defined(my $end = $self->end_range)) {
+          return '' if (my $chunk = $end + 1 - $offset) <= 0;
+          read $afh, $buffer, ($chunk > $max ? $max : $chunk);
+        }
+        else { read $afh, $buffer, $max }
+        return $buffer;
+      }
+    }
+  }
+
   my $handle = $self->handle;
   $handle->sysseek($offset, SEEK_SET);
 
@@ -100,6 +131,7 @@ sub move_to {
   my ($self, $to) = @_;
 
   # Windows requires that the handle is closed
+  if (my $afh = delete $self->{_async_handle}) { close $afh }
   close $self->handle;
   delete $self->{handle};
 
@@ -108,7 +140,14 @@ sub move_to {
   return $self->path($to)->cleanup(0);
 }
 
-sub mtime { (stat shift->handle)[9] }
+sub mtime {
+  my $self = shift;
+  if (!$self->{handle} && defined(my $path = $self->{path})) {
+    my @st = USE_MT_ASYNC_IO ? MT::IO::stat($path) : stat($path);
+    return $st[9] if @st;
+  }
+  return (stat $self->handle)[9];
+}
 
 sub new {
   my $file = shift->SUPER::new(@_);
@@ -116,10 +155,36 @@ sub new {
   return $file;
 }
 
-sub size { -s shift->handle }
+sub size {
+  my $self = shift;
+  if (!$self->{handle} && defined(my $path = $self->{path})) {
+    if (USE_MT_ASYNC_IO) {
+      my @st = MT::IO::stat($path);
+      return $st[7] if @st;
+    }
+    else {
+      my $sz = -s $path;
+      return $sz if defined $sz;
+    }
+  }
+  return -s $self->handle;
+}
 
 sub slurp {
-  my $handle = shift->handle;
+  my $self = shift;
+  if (HAS_MT_ASYNC_IO && !$self->{handle} && !$self->{cleanup} && defined(my $path = $self->{path})) {
+    if (USE_MT_ASYNC_IO || (($self->size // 0) >= ASYNC_IO_MIN_SIZE)) {
+      if (open my $afh, '<:async', $path) {
+        my $ret = my $content = '';
+        while ($ret = read $afh, my $buffer, 65536) { $content .= $buffer }
+        my $err = defined $ret ? undef : $!;
+        close $afh;
+        croak "Can't read from asset: $err" if defined $err;
+        return $content;
+      }
+    }
+  }
+  my $handle = $self->handle;
   $handle->sysseek(0, SEEK_SET);
   my $ret = my $content = '';
   while ($ret = $handle->sysread(my $buffer, 131072, 0)) { $content .= $buffer }

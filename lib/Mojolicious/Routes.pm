@@ -49,7 +49,29 @@ sub continue {
 sub dispatch {
   my ($self, $c) = @_;
   $self->match($c);
-  @{$c->match->stack} ? $self->continue($c) : return undef;
+  my $match = $c->match;
+  my $stack = $match->stack;
+  return undef unless @$stack;
+
+  # Fast path for single-step callback routes (no under bridges)
+  if (@$stack == 1 && !($match->{position}) && (my $cb = $stack->[0]{cb})) {
+    my $field = $stack->[0];
+    my $stash = $c->stash;
+    @{$stash->{'mojo.captures'} //= {}}{keys %$field} = values %$field;
+    @$stash{keys %$field} = values %$field;
+    $stash->{'mojo.routed'} = 1;
+    my $app = $c->app;
+    my $log = $app->{log};
+    $c->helpers->log->trace('Routing to a callback') if !$log || $log->is_level('trace');
+    my $hooks = $app->plugins->{events}{around_action};
+    if ($hooks && @$hooks == 1) { $hooks->[0]->(undef, $c, $cb, 1) }
+    else                        { $app->plugins->emit_chain(around_action => $c, $cb, 1) }
+    $match->{position} = 1;
+    _render($c) unless $stash->{'mojo.rendered'};
+    return 1;
+  }
+
+  $self->continue($c);
   return 1;
 }
 
@@ -66,30 +88,47 @@ sub match {
 
   # Method (HEAD will be treated as GET)
   my $method = uc $req->method;
-  if ($method eq 'POST' && (my $override = $req->url->query->clone->param('_method'))) { $method = uc $override }
+  if ($method eq 'POST' && $req->url->{query} && (my $override = $req->url->query->clone->param('_method'))) {
+    $method = uc $override;
+  }
   $method = 'GET' if $method eq 'HEAD';
 
   # Check cache
   my $ws    = $c->tx->is_websocket ? 1 : 0;
   my $match = $c->match;
-  $match->root($self);
-  my $cache = $self->cache;
-  if (my $result = $cache->get("$method:$path:$ws")) {
+  my $cache = $self->{cache} // $self->cache;
+  if (ref $cache eq 'Mojo::Cache') {
+    if (my $ch = $cache->{cache}) {
+      if (my $result = $ch->{"$method:$path:$ws"}) {
+        @$match{qw(root endpoint stack)} = ($self, $result->{endpoint}, $result->{stack});
+        return $match;
+      }
+    }
+  }
+  elsif (my $result = $cache->get("$method:$path:$ws")) {
+    $match->root($self);
     return $match->endpoint($result->{endpoint})->stack($result->{stack});
   }
 
   # Check routes
+  $match->root($self);
   $match->find($c => {method => $method, path => $path, websocket => $ws});
   return undef unless my $route = $match->endpoint;
   $cache->set("$method:$path:$ws" => {endpoint => $route, stack => $match->stack});
 }
 
-sub _action { shift->plugins->emit_chain(around_action => @_) }
+sub _action {
+  my ($app, $c, $cb, $last) = @_;
+  my $hooks = $app->plugins->{events}{around_action};
+  return $hooks->[0]->(undef, $c, $cb, $last) if $hooks && @$hooks == 1;
+  return $app->plugins->emit_chain(around_action => $c, $cb, $last);
+}
 
 sub _callback {
   my ($self, $c, $cb, $last) = @_;
   $c->stash->{'mojo.routed'} = 1 if $last;
-  $c->helpers->log->trace('Routing to a callback');
+  my $log = $c->app->{log};
+  $c->helpers->log->trace('Routing to a callback') if !$log || $log->is_level('trace');
   return _action($c->app, $c, $cb, $last);
 }
 

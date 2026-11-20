@@ -1,12 +1,25 @@
 package Mojolicious::Static;
 use Mojo::Base -base;
 
+use Fcntl        qw(S_ISREG);
 use Mojo::Asset::File;
 use Mojo::Asset::Memory;
 use Mojo::Date;
 use Mojo::File   qw(curfile path);
 use Mojo::Loader qw(data_section file_is_binary);
+use Mojo::MT     qw(HAS_MT_ASYNC_IO);
 use Mojo::Util   qw(encode md5_sum trim);
+
+use constant USE_MT_ASYNC_IO => HAS_MT_ASYNC_IO && ($^O eq 'linux');
+use constant STATIC_CACHE_MAX_SIZE    => 65536;
+use constant STATIC_CACHE_MAX_ENTRIES => 256;
+
+BEGIN {
+  require MT::IO if HAS_MT_ASYNC_IO;
+}
+
+# Worker-isolated hot static asset cache (our-scoped for perl5-mt worker isolation)
+our %STATIC_CACHE;
 
 # Bundled files
 my $PUBLIC = curfile->sibling('resources', 'public');
@@ -35,13 +48,27 @@ sub dispatch {
 
   # Canonical path
   my $stash = $c->stash;
-  my $path  = $req->url->path;
-  $path = $stash->{path} ? $path->new($stash->{path}) : $path->clone;
-  return undef unless my @parts = @{$path->canonicalize->parts};
+  my $canon_path;
+  my $url_path = $req->url->path;
+  my $raw      = (!defined $stash->{path} && !$url_path->{parts}) ? $url_path->{path} : undef;
+  if (defined $raw && length($raw) > 1 && substr($raw, 0, 1) eq '/'
+   && index($raw, '%') < 0 && index($raw, '..') < 0 && index($raw, '\\') < 0
+   && index($raw, '//') < 0 && index($raw, '/./') < 0 && substr($raw, -2) ne '/.'
+   && ($raw =~ tr/\x00-\x7f//c) == 0)
+  {
+    $canon_path = substr($raw, 1);
+    chop $canon_path if substr($canon_path, -1) eq '/';
+    return undef unless length $canon_path;
+  }
+  else {
+    my $path = $stash->{path} ? $url_path->new($stash->{path}) : $url_path->clone;
+    return undef unless my @parts = @{$path->canonicalize->parts};
+    $canon_path = join '/', @parts;
+    return undef if $canon_path =~ /^\.\.\/|\\/;
+  }
 
-  # Serve static file and prevent path traversal
-  my $canon_path = join '/', @parts;
-  return undef if $canon_path =~ /^\.\.\/|\\/ || !$self->serve($c, $canon_path);
+  # Serve static file
+  return undef unless $self->serve($c, $canon_path);
   $stash->{'mojo.static'} = 1;
 
   # Development assets will be rebuilt a lot, do not let browsers cache them
@@ -107,6 +134,78 @@ sub serve {
   if (my $prefix = $self->prefix) {
     $rel = "/$rel";
     return undef unless $rel =~ s/^\Q$prefix\E\///;
+  }
+
+  # Hot static cache fast-path for small read-only files (<= 64 KiB)
+  if (!$ENV{MOJO_STATIC_NO_CACHE} && $^O ne 'MSWin32') {
+    $self->warmup unless $self->{index};
+    for my $dir (@{$self->paths}) {
+      my $abs = "$dir/$rel";
+      no warnings 'newline';
+      my @st = USE_MT_ASYNC_IO ? MT::IO::stat($abs) : stat($abs);
+      next unless @st && S_ISREG($st[2]) && -r $abs;
+
+      if ($st[7] <= STATIC_CACHE_MAX_SIZE) {
+        my $entry = $STATIC_CACHE{$abs};
+        if (!$entry || $entry->{mtime} != $st[9] || $entry->{size} != $st[7]) {
+          if (open my $fh, '<:raw', $abs) {
+            my $buf = '';
+            my $n   = $st[7] ? read($fh, $buf, $st[7]) : 0;
+            close $fh;
+            if (defined $n && $n == $st[7]) {
+              %STATIC_CACHE = () if keys(%STATIC_CACHE) >= STATIC_CACHE_MAX_ENTRIES;
+              $entry = $STATIC_CACHE{$abs} = {
+                mtime         => $st[9],
+                size          => $st[7],
+                content       => $buf,
+                etag          => qq{"} . md5_sum($st[9]) . qq{"},
+                last_modified => Mojo::Date->new($st[9])->to_string,
+              };
+            }
+          }
+        }
+        if ($entry) {
+          $c->app->types->content_type($c, {file => $rel});
+          my $req_h = $c->req->headers;
+          my $res   = $c->res;
+          my $res_h = $res->headers;
+          $res->code(200);
+          $res_h->accept_ranges('bytes');
+          if ($req_h->if_none_match || $req_h->if_modified_since) {
+            my $options = {etag => $entry->{etag}, last_modified => $entry->{mtime}};
+            # Strip quotes so is_fresh quotes identically
+            (my $raw_etag = $entry->{etag}) =~ s/^"|"$//g;
+            $options->{etag} = $raw_etag;
+            return !!$res->code(304) if $self->is_fresh($c, $options);
+          }
+          else {
+            $res_h->last_modified($entry->{last_modified});
+            $res_h->etag($entry->{etag});
+          }
+          my $mem = bless {content => $entry->{content}, mtime => $entry->{mtime}}, 'Mojo::Asset::Memory';
+          if (my $range = $req_h->range) {
+            return !!$self->serve_asset($c, $mem);
+          }
+          $res->content->asset($mem);
+          return 1;
+        }
+      }
+
+      # File found but larger than cache threshold -> serve directly without re-statting paths
+      my $asset = Mojo::Asset::File->new(path => $abs);
+      $c->app->types->content_type($c, {file => $rel});
+      return !!$self->serve_asset($c, $asset);
+    }
+
+    # Not found in paths; check DATA and extra directly (avoid re-statting paths in $self->file)
+    my $asset = $self->_get_data_file($rel);
+    if (!$asset) {
+      my $extra = $self->extra;
+      $asset = _get_file($extra->{$rel}) if exists $extra->{$rel};
+    }
+    return undef unless $asset;
+    $c->app->types->content_type($c, {file => $rel});
+    return !!$self->serve_asset($c, $asset);
   }
 
   return undef unless my $asset = $self->file($rel);
@@ -187,6 +286,10 @@ sub _get_data_file {
 sub _get_file {
   my $path = shift;
   no warnings 'newline';
+  if (USE_MT_ASYNC_IO) {
+    my @st = MT::IO::stat($path);
+    return (@st && S_ISREG($st[2]) && -r $path) ? Mojo::Asset::File->new(path => $path) : undef;
+  }
   return -f $path && -r _ ? Mojo::Asset::File->new(path => $path) : undef;
 }
 

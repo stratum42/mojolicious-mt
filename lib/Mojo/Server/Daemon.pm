@@ -78,39 +78,50 @@ sub _build_tx {
 
   my $tx = $self->build_tx->connection($id);
   $tx->res->headers->server('Mojolicious (Perl)');
-  my $handle = $self->ioloop->stream($id)->timeout($self->inactivity_timeout)->handle;
-  unless ($handle->isa('IO::Socket::UNIX')) {
+  my $stream = $c->{stream} // $self->ioloop->stream($id);
+  my $inactivity = $self->inactivity_timeout;
+  $stream->timeout($inactivity) if ($stream->{timeout} // -1) != $inactivity;
+  my $handle = $stream->{handle};
+  my $is_unix = $c->{is_unix} //= ($handle->isa('IO::Socket::UNIX') ? 1 : 0);
+  unless ($is_unix) {
     my $addr = $c->{addr} //= [$handle->sockhost, $handle->sockport, $handle->peerhost, $handle->peerport];
     $tx->local_address($addr->[0])->local_port($addr->[1]);
     $tx->remote_address($addr->[2])->remote_port($addr->[3]);
   }
   $tx->req->url->base->scheme('https') if $c->{tls};
 
-  weaken $self;
-  $tx->on(
-    request => sub {
+  my $req_cb = $c->{req_cb} //= do {
+    my $w = $self;
+    weaken $w;
+    my $resume_cb = $c->{resume_cb} //= sub { $w && $w->_write($id) };
+    sub {
       my $tx = shift;
 
       my $req = $tx->req;
-      if (my $error = $req->error) { $self->_trace($id, $error->{message}) }
+      if (my $error = $req->error) { $w->_trace($id, $error->{message}) }
 
       # WebSocket
       if ($req->is_handshake) {
-        my $ws = $self->{connections}{$id}{next} = Mojo::Transaction::WebSocket->new(handshake => $tx);
-        $self->emit(request => server_handshake $ws);
+        my $ws = $w->{connections}{$id}{next} = Mojo::Transaction::WebSocket->new(handshake => $tx);
+        $w->emit(request => server_handshake $ws);
       }
 
       # HTTP
-      else { $self->emit(request => $tx) }
+      else {
+        my $evs = $w->{events}{request};
+        if ($evs && @$evs == 1) { $evs->[0]->($w, $tx) }
+        else                    { $w->emit(request => $tx) }
+      }
 
       # Last keep-alive request or corrupted connection
-      my $c = $self->{connections}{$id};
-      $tx->res->headers->connection('close') if ($c->{requests} || 1) >= $self->max_requests || $req->error;
+      my $c = $w->{connections}{$id};
+      $tx->res->headers->connection('close') if ($c->{requests} || 1) >= $w->max_requests || $req->error;
 
-      $tx->on(resume => sub { $self && $self->_write($id) });
-      $self->_write($id);
-    }
-  );
+      $w->_write($id);
+      $tx->on(resume => $resume_cb) unless $tx->is_finished;
+    };
+  };
+  $tx->on(request => $req_cb);
 
   # Kept alive if we have more than one request on the connection
   return ++$c->{requests} > 1 ? $tx->kept_alive(1) : $tx;
@@ -161,7 +172,7 @@ sub _finish {
   }
 
   # Keep-alive connection
-  $self->ioloop->stream($id)->timeout($self->keep_alive_timeout) unless $c->{tx};
+  ($c->{stream} // $self->ioloop->stream($id))->timeout($self->keep_alive_timeout) unless $c->{tx};
 }
 
 sub _listen {
@@ -195,7 +206,8 @@ sub _listen {
     $options => sub {
       my ($loop, $stream, $id) = @_;
 
-      $self->{connections}{$id} = {tls => $tls};
+      my $c = $self->{connections}{$id} = {tls => $tls, stream => $stream};
+      weaken $c->{stream};
       warn "-- Accept $id (@{[_peer($stream->handle)]})\n" if DEBUG;
       $stream->timeout($self->inactivity_timeout);
 
@@ -240,13 +252,23 @@ sub _write {
   # Protect from resume event recursion
   my $c = $self->{connections}{$id};
   return if !(my $tx = $c->{tx}) || $c->{writing};
-  local $c->{writing} = 1;
-  my $chunk = $tx->server_write;
+  my ($chunk, $finished);
+  {
+    local $c->{writing} = 1;
+    $chunk    = $tx->server_write;
+    $finished = $tx->is_finished;
+  }
   warn term_escape "-- Server >>> Client (@{[_url($tx)]})\n$chunk\n" if DEBUG;
-  my $next = $tx->is_finished ? '_finish' : length $chunk ? '_write' : undef;
-  return $self->ioloop->stream($id)->write($chunk) unless $next;
-  weaken $self;
-  $self->ioloop->stream($id)->write($chunk => sub { $self && $self->$next($id) });
+  my $stream = $c->{stream} // $self->ioloop->stream($id);
+  if ($finished) {
+    my $cb = $c->{finish_cb} //= do { my $w = $self; weaken $w; sub { $w && $w->_finish($id) } };
+    return (!$c->{tls} && length $chunk) ? $stream->_write_now($chunk => $cb) : $stream->write($chunk => $cb);
+  }
+  if (length $chunk) {
+    my $cb = $c->{write_cb} //= do { my $w = $self; weaken $w; sub { $w && $w->_write($id) } };
+    return $stream->write($chunk => $cb);
+  }
+  return $stream->write($chunk);
 }
 
 1;
