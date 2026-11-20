@@ -1,4 +1,4 @@
-/* mt_resp.h - Zero-copy C/NEON RESP2/RESP3 encoder, streaming parser,
+/* mt_resp.h - Zero-copy C/SIMD RESP2/RESP3 encoder, streaming parser,
  * and per-worker TCP/Unix connection pool for Mojo::MT::KeyDB::XS.
  *
  * Strictly zero mutable global state: all connection state lives in MY_CXT.
@@ -26,12 +26,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#if defined(__ARM_NEON) || defined(__aarch64__)
-#include <arm_neon.h>
-#define MT_RESP_HAS_NEON 1
-#else
-#define MT_RESP_HAS_NEON 0
-#endif
+#include "mt_resp_simd.h"
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -137,7 +132,7 @@ static inline int mt_parse_i64(const char *s, size_t len, int64_t *out) {
 }
 
 /* --------------------------------------------------------------------------
- * SIMD (ARM64 NEON) CRLF scanner
+ * Multi-arch SIMD CRLF scanner (via mt_resp_find_byte)
  * Returns offset of '\r' in buf[start..len-1] where buf[offset+1] == '\n',
  * or -1 if not found.
  * -------------------------------------------------------------------------- */
@@ -146,26 +141,11 @@ static inline ssize_t mt_resp_find_crlf(const char *buf, size_t len, size_t star
   if (len < 2 || start + 1 >= len) return -1;
   size_t i = start;
 
-#if MT_RESP_HAS_NEON && defined(__aarch64__)
-  const uint8x16_t vcr = vdupq_n_u8('\r');
-  while (i + 16 < len) {
-    uint8x16_t chunk = vld1q_u8((const uint8_t *)(buf + i));
-    uint8x16_t eq    = vceqq_u8(chunk, vcr);
-    if (vmaxvq_u8(eq) != 0) {
-      for (size_t j = 0; j < 16; j++) {
-        if (buf[i + j] == '\r' && buf[i + j + 1] == '\n') {
-          return (ssize_t)(i + j);
-        }
-      }
-    }
-    i += 16;
-  }
-#endif
-
   while (i + 1 < len) {
-    const char *p = (const char *)memchr(buf + i, '\r', len - 1 - i);
+    const unsigned char *p = mt_resp_find_byte(
+      (const unsigned char *)(buf + i), len - 1 - i, (unsigned char)'\r');
     if (!p) return -1;
-    size_t off = (size_t)(p - buf);
+    size_t off = (size_t)((const char *)p - buf);
     if (buf[off + 1] == '\n') return (ssize_t)off;
     i = off + 1;
   }

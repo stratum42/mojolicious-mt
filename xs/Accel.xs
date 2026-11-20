@@ -1,4 +1,4 @@
-/* Mojo::MT::Accel - Tier-1 thread-safe C/NEON accelerator for mojolicious-mt.
+/* Mojo::MT::Accel - Tier-1 thread-safe C/SIMD accelerator for mojolicious-mt.
  * Compiled with -DPERL_XS_THREADSAFE=1 and PERL_NO_GET_CONTEXT.
  * Zero mutable global state: all per-interpreter state lives in MY_CXT.
  */
@@ -8,6 +8,7 @@
 #include "perl.h"
 #include "XSUB.h"
 
+#include "mt_simd.h"
 #include "mt_util.h"
 #include "mt_http.h"
 #include "mt_json.h"
@@ -57,8 +58,22 @@ CLONE(...)
 #endif
 
 # ============================================================================
-# Monotonic clock
+# Introspection & Monotonic clock
 # ============================================================================
+
+const char *
+simd_tier()
+  CODE:
+    RETVAL = mt_simd_tier_name();
+  OUTPUT:
+    RETVAL
+
+const char *
+reactor_backend()
+  CODE:
+    RETVAL = mt_reactor_backend_name();
+  OUTPUT:
+    RETVAL
 
 NV
 monotonic_time()

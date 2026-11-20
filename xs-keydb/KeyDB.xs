@@ -1,4 +1,4 @@
-/* Mojo::MT::KeyDB::XS - Tier-1 thread-safe C/NEON KeyDB/RESP2/RESP3 client.
+/* Mojo::MT::KeyDB::XS - Thread-safe C/SIMD KeyDB RESP2/RESP3 client.
  * Compiled with -DPERL_XS_THREADSAFE=1 and PERL_NO_GET_CONTEXT.
  * Zero mutable global state: all per-worker connections and buffers live in MY_CXT.
  */
@@ -58,6 +58,13 @@ CLONE(...)
     PERL_UNUSED_VAR(items);
 
 #endif
+
+const char *
+simd_tier()
+  CODE:
+    RETVAL = mt_resp_simd_tier_name();
+  OUTPUT:
+    RETVAL
 
 SV *
 encode_cmd(...)

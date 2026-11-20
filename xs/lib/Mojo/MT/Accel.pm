@@ -13,14 +13,16 @@ XSLoader::load('Mojo::MT::Accel', $VERSION);
 
 =head1 NAME
 
-Mojo::MT::Accel - Optional thread-safe C/NEON accelerator for mojolicious-mt
+Mojo::MT::Accel - Optional thread-safe C/SIMD accelerator for mojolicious-mt
 
 =head1 DESCRIPTION
 
 L<Mojo::MT::Accel> provides optional thread-safe (C<PERL_XS_THREADSAFE=1>) C
-and ARM64 NEON implementations for the L<Mojo::Reactor::MT> kqueue/epoll event
-loop, HTTP/1.1 request/header parsing and response serialization, L<Mojo::JSON>
-encoding and decoding, and L<Mojo::Util> string helpers. Edge cases delegate
-back to Mojolicious's pure-Perl implementations.
+and SIMD (amd64 AVX2/SSE2, arm64 NEON, POWER VSX/AltiVec, IBM Z VX, and a
+portable scalar twin) implementations for the L<Mojo::Reactor::MT> event loop
+(C<kqueue>, C<epoll>, AIX C<pollset>, and POSIX C<poll>), HTTP/1.1
+request/header parsing and response serialization, L<Mojo::JSON> encoding and
+decoding, and L<Mojo::Util> string helpers. Edge cases delegate back to
+Mojolicious's pure-Perl implementations.
 
 =cut

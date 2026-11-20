@@ -5,55 +5,22 @@
 #include <stddef.h>
 #include <string.h>
 
-#if defined(__ARM_NEON) || defined(__aarch64__)
-#  include <arm_neon.h>
-#  ifndef MT_HAS_NEON
-#    define MT_HAS_NEON 1
-#  endif
-#else
-#  ifndef MT_HAS_NEON
-#    define MT_HAS_NEON 0
-#  endif
-#endif
+#include "mt_simd.h"
 
 static inline int mt_http_is_ws(unsigned char c) {
   return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v';
 }
 
 static inline const unsigned char *mt_find_lf(const unsigned char *p, const unsigned char *end) {
-#if MT_HAS_NEON
-  if (end - p >= 16) {
-    const uint8x16_t v_lf = vdupq_n_u8('\n');
-    while (p + 16 <= end) {
-      uint8x16_t v = vld1q_u8(p);
-      if (vmaxvq_u8(vceqq_u8(v, v_lf)) != 0) break;
-      p += 16;
-    }
-  }
-#endif
-  while (p < end) {
-    if (*p == '\n') return p;
-    p++;
-  }
-  return NULL;
+  size_t len = (size_t)(end - p);
+  size_t idx = mt_simd_find_byte(p, len, '\n');
+  return (idx < len) ? (p + idx) : NULL;
 }
 
 static inline const unsigned char *mt_find_colon(const unsigned char *p, const unsigned char *end) {
-#if MT_HAS_NEON
-  if (end - p >= 16) {
-    const uint8x16_t v_col = vdupq_n_u8(':');
-    while (p + 16 <= end) {
-      uint8x16_t v = vld1q_u8(p);
-      if (vmaxvq_u8(vceqq_u8(v, v_col)) != 0) break;
-      p += 16;
-    }
-  }
-#endif
-  while (p < end) {
-    if (*p == ':') return p;
-    p++;
-  }
-  return NULL;
+  size_t len = (size_t)(end - p);
+  size_t idx = mt_simd_find_byte(p, len, ':');
+  return (idx < len) ? (p + idx) : NULL;
 }
 
 /* Fast lookup for common Mojolicious %NAMES headers (lowercase input -> canonical name).

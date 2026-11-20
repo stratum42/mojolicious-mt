@@ -17,12 +17,12 @@ END {
 
 =head1 NAME
 
-Mojo::MT::KeyDB::XS - Optional thread-safe C/NEON KeyDB RESP2/RESP3 client
+Mojo::MT::KeyDB::XS - Optional thread-safe C/SIMD KeyDB RESP2/RESP3 client
 
 =head1 DESCRIPTION
 
 L<Mojo::MT::KeyDB::XS> provides an optional thread-safe
-(C<PERL_XS_THREADSAFE=1>) C/NEON RESP2/RESP3 encoder, streaming reply parser,
+(C<PERL_XS_THREADSAFE=1>) C/SIMD RESP2/RESP3 encoder, streaming reply parser,
 and per-worker C<MY_CXT> TCP/Unix socket pool for L<Mojo::MT::KeyDB>.
 
 =cut

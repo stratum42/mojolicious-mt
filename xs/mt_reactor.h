@@ -9,18 +9,45 @@
 #include <unistd.h>
 #include <time.h>
 
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+#if !defined(MT_FORCE_POLL) && (defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__))
 #  define MT_USE_KQUEUE 1
 #  include <sys/types.h>
 #  include <sys/event.h>
 #  include <sys/time.h>
 #  define MT_WAKE_IDENT 0x4d54574bUL
-#elif defined(__linux__)
+#elif !defined(MT_FORCE_POLL) && defined(__linux__)
 #  define MT_USE_EPOLL 1
 #  include <sys/epoll.h>
 #  include <sys/eventfd.h>
+#elif !defined(MT_FORCE_POLL) && defined(_AIX) && !defined(__PASE__)
+#  define MT_USE_POLLSET 1
+#  include <sys/pollset.h>
+#  include <fcntl.h>
 #else
-#  error "Mojo::Reactor::MT requires kqueue (macOS/BSD) or epoll (Linux)"
+#  define MT_USE_POLL 1
+#  include <poll.h>
+#  include <fcntl.h>
+#endif
+
+static inline const char *mt_reactor_backend_name(void) {
+#if defined(MT_USE_KQUEUE)
+  return "kqueue";
+#elif defined(MT_USE_EPOLL)
+  return "epoll";
+#elif defined(MT_USE_POLLSET)
+  return "pollset";
+#else
+  return "poll";
+#endif
+}
+
+#if defined(MT_USE_POLLSET) || defined(MT_USE_POLL)
+static inline void mt_set_nonblock_cloexec(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  int fdflags = fcntl(fd, F_GETFD, 0);
+  if (fdflags >= 0) (void)fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC);
+}
 #endif
 
 #define MT_REACTOR_MAX_EVENTS 128
@@ -52,10 +79,19 @@ typedef struct {
 } mt_timer_slot_t;
 
 typedef struct {
-  int              poll_fd;    /* kqueue fd or epoll fd */
-#ifdef MT_USE_EPOLL
-  int              wake_fd;    /* eventfd */
-#else
+#if defined(MT_USE_POLLSET)
+  pollset_t        poll_fd;      /* AIX pollset handle */
+  int              wake_pipe[2]; /* self-pipe wakeup */
+#elif defined(MT_USE_POLL)
+  int              poll_fd;      /* unused (-1) */
+  int              wake_pipe[2]; /* self-pipe wakeup */
+  struct pollfd   *pfds;
+  int              pfds_cap;
+#elif defined(MT_USE_EPOLL)
+  int              poll_fd;      /* epoll fd */
+  int              wake_fd;      /* eventfd */
+#else /* MT_USE_KQUEUE */
+  int              poll_fd;      /* kqueue fd */
   int             *dirty_fds;
   int              dirty_len;
   int              dirty_cap;
@@ -170,7 +206,7 @@ static mt_reactor_t *mt_reactor_new(void) {
   r->next_gen   = 1;
   r->generation = 1;
 
-#ifdef MT_USE_KQUEUE
+#if defined(MT_USE_KQUEUE)
   r->poll_fd = kqueue();
   if (r->poll_fd < 0) {
     free(r);
@@ -179,7 +215,7 @@ static mt_reactor_t *mt_reactor_new(void) {
   struct kevent ev;
   EV_SET(&ev, MT_WAKE_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   kevent(r->poll_fd, &ev, 1, NULL, 0, NULL);
-#else
+#elif defined(MT_USE_EPOLL)
   r->poll_fd = epoll_create1(EPOLL_CLOEXEC);
   if (r->poll_fd < 0) {
     free(r);
@@ -195,6 +231,32 @@ static mt_reactor_t *mt_reactor_new(void) {
   ev.events  = EPOLLIN;
   ev.data.fd = r->wake_fd;
   epoll_ctl(r->poll_fd, EPOLL_CTL_ADD, r->wake_fd, &ev);
+#elif defined(MT_USE_POLLSET)
+  r->poll_fd = pollset_create(-1);
+  if (r->poll_fd < 0) {
+    free(r);
+    return NULL;
+  }
+  if (pipe(r->wake_pipe) < 0) {
+    pollset_destroy(r->poll_fd);
+    free(r);
+    return NULL;
+  }
+  mt_set_nonblock_cloexec(r->wake_pipe[0]);
+  mt_set_nonblock_cloexec(r->wake_pipe[1]);
+  struct poll_ctl pc;
+  pc.cmd    = PS_ADD;
+  pc.events = POLLIN;
+  pc.fd     = r->wake_pipe[0];
+  pollset_ctl(r->poll_fd, &pc, 1);
+#else /* MT_USE_POLL */
+  r->poll_fd = -1;
+  if (pipe(r->wake_pipe) < 0) {
+    free(r);
+    return NULL;
+  }
+  mt_set_nonblock_cloexec(r->wake_pipe[0]);
+  mt_set_nonblock_cloexec(r->wake_pipe[1]);
 #endif
   return r;
 }
@@ -203,14 +265,22 @@ static void mt_reactor_clear_io(pTHX_ mt_reactor_t *r) {
   for (int fd = 0; fd < r->io_cap; fd++) {
     mt_io_watcher_t *w = &r->io[fd];
     if (!w->active && !w->reg_r && !w->reg_w) continue;
-#ifdef MT_USE_KQUEUE
+#if defined(MT_USE_KQUEUE)
     struct kevent ev[2];
     int n = 0;
     if (w->reg_r) EV_SET(&ev[n++], fd, EVFILT_READ,  EV_DELETE, 0, 0, NULL);
     if (w->reg_w) EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
     if (n > 0) kevent(r->poll_fd, ev, n, NULL, 0, NULL);
-#else
+#elif defined(MT_USE_EPOLL)
     if (w->reg_r || w->reg_w) epoll_ctl(r->poll_fd, EPOLL_CTL_DEL, fd, NULL);
+#elif defined(MT_USE_POLLSET)
+    if (w->reg_r || w->reg_w) {
+      struct poll_ctl pc;
+      pc.cmd    = PS_DELETE;
+      pc.events = 0;
+      pc.fd     = fd;
+      pollset_ctl(r->poll_fd, &pc, 1);
+    }
 #endif
     if (w->cb) {
       SvREFCNT_dec(w->cb);
@@ -257,10 +327,19 @@ static void mt_reactor_destroy(pTHX_ mt_reactor_t *r) {
   if (!r) return;
   mt_reactor_clear_io(aTHX_ r);
   mt_reactor_clear_timers(aTHX_ r);
+#if defined(MT_USE_POLLSET)
+  if (r->poll_fd >= 0) pollset_destroy(r->poll_fd);
+  if (r->wake_pipe[0] >= 0) close(r->wake_pipe[0]);
+  if (r->wake_pipe[1] >= 0) close(r->wake_pipe[1]);
+#elif defined(MT_USE_POLL)
+  if (r->wake_pipe[0] >= 0) close(r->wake_pipe[0]);
+  if (r->wake_pipe[1] >= 0) close(r->wake_pipe[1]);
+  free(r->pfds);
+#elif defined(MT_USE_EPOLL)
   if (r->poll_fd >= 0) close(r->poll_fd);
-#ifdef MT_USE_EPOLL
   if (r->wake_fd >= 0) close(r->wake_fd);
-#else
+#else /* MT_USE_KQUEUE */
+  if (r->poll_fd >= 0) close(r->poll_fd);
   free(r->dirty_fds);
 #endif
   free(r->io);
@@ -293,10 +372,10 @@ static int mt_reactor_watch(mt_reactor_t *r, int fd, int want_r, int want_w) {
   if (w->mode == nm && w->reg_r == nr && w->reg_w == nw) return 1;
   w->mode = nm;
 
-#ifdef MT_USE_KQUEUE
+#if defined(MT_USE_KQUEUE)
   /* Defer kqueue changes to the single kevent() call in mt_reactor_wait() */
   mt_mark_dirty(r, fd);
-#else
+#elif defined(MT_USE_EPOLL)
   uint32_t events = 0;
   if (nr) events |= EPOLLIN | EPOLLPRI;
   if (nw) events |= EPOLLOUT;
@@ -312,6 +391,30 @@ static int mt_reactor_watch(mt_reactor_t *r, int fd, int want_r, int want_w) {
   } else if (was_reg) {
     epoll_ctl(r->poll_fd, EPOLL_CTL_DEL, fd, NULL);
   }
+  w->reg_r = nr;
+  w->reg_w = nw;
+#elif defined(MT_USE_POLLSET)
+  short events = 0;
+  if (nr) events |= POLLIN | POLLPRI;
+  if (nw) events |= POLLOUT;
+  int was_reg = (w->reg_r || w->reg_w);
+  if (was_reg) {
+    struct poll_ctl pc;
+    pc.cmd    = PS_DELETE;
+    pc.events = 0;
+    pc.fd     = fd;
+    pollset_ctl(r->poll_fd, &pc, 1);
+  }
+  if (events) {
+    struct poll_ctl pc;
+    pc.cmd    = PS_ADD;
+    pc.events = events;
+    pc.fd     = fd;
+    pollset_ctl(r->poll_fd, &pc, 1);
+  }
+  w->reg_r = nr;
+  w->reg_w = nw;
+#else /* MT_USE_POLL */
   w->reg_r = nr;
   w->reg_w = nw;
 #endif
@@ -335,13 +438,27 @@ static int mt_reactor_io(pTHX_ mt_reactor_t *r, int fd, SV *cb) {
 static int mt_reactor_remove_io(pTHX_ mt_reactor_t *r, int fd) {
   if (fd < 0 || fd >= r->io_cap || !r->io[fd].active) return 0;
   mt_io_watcher_t *w = &r->io[fd];
-#ifdef MT_USE_KQUEUE
+#if defined(MT_USE_KQUEUE)
   w->mode = 0;
   if (w->reg_r || w->reg_w) {
     mt_mark_dirty(r, fd);
   }
-#else
+#elif defined(MT_USE_EPOLL)
   if (w->reg_r || w->reg_w) epoll_ctl(r->poll_fd, EPOLL_CTL_DEL, fd, NULL);
+  w->reg_r = 0;
+  w->reg_w = 0;
+#elif defined(MT_USE_POLLSET)
+  if (w->reg_r || w->reg_w) {
+    struct poll_ctl pc;
+    pc.cmd    = PS_DELETE;
+    pc.events = 0;
+    pc.fd     = fd;
+    pollset_ctl(r->poll_fd, &pc, 1);
+  }
+  w->reg_r = 0;
+  w->reg_w = 0;
+#else /* MT_USE_POLL */
+  w->mode  = 0;
   w->reg_r = 0;
   w->reg_w = 0;
 #endif
@@ -509,14 +626,21 @@ static void mt_reactor_reinsert_timers(pTHX_ mt_reactor_t *r, uint64_t gen, AV *
 /* ---- Wakeup & Event Wait ---- */
 
 static void mt_reactor_wake(mt_reactor_t *r) {
-  if (!r || r->poll_fd < 0) return;
-#ifdef MT_USE_KQUEUE
+  if (!r) return;
+#if defined(MT_USE_KQUEUE)
+  if (r->poll_fd < 0) return;
   struct kevent ev;
   EV_SET(&ev, MT_WAKE_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
   kevent(r->poll_fd, &ev, 1, NULL, 0, NULL);
-#else
+#elif defined(MT_USE_EPOLL)
+  if (r->wake_fd < 0) return;
   uint64_t one = 1;
   ssize_t ignored = write(r->wake_fd, &one, sizeof(one));
+  (void)ignored;
+#else /* MT_USE_POLLSET || MT_USE_POLL */
+  if (r->wake_pipe[1] < 0) return;
+  char b = 1;
+  ssize_t ignored = write(r->wake_pipe[1], &b, 1);
   (void)ignored;
 #endif
 }
@@ -604,7 +728,7 @@ static int mt_reactor_wait(pTHX_ mt_reactor_t *r, AV *ready_av, int *woke_out, i
       }
     }
   }
-#else
+#elif defined(MT_USE_EPOLL)
   struct epoll_event events[MT_REACTOR_MAX_EVENTS];
   int ms = (timeout <= 0.0) ? 0 : (int)(timeout * 1000.0) + 1;
   int n = epoll_wait(r->poll_fd, events, MT_REACTOR_MAX_EVENTS, ms);
@@ -624,6 +748,82 @@ static int mt_reactor_wait(pTHX_ mt_reactor_t *r, AV *ready_av, int *woke_out, i
         count++;
       }
       if (ev & EPOLLOUT) {
+        av_push(ready_av, newSViv(fd));
+        av_push(ready_av, newSViv(1));
+        count++;
+      }
+    }
+  }
+#elif defined(MT_USE_POLLSET)
+  struct pollfd events[MT_REACTOR_MAX_EVENTS];
+  int ms = (timeout <= 0.0) ? 0 : (int)(timeout * 1000.0) + 1;
+  int n = pollset_poll(r->poll_fd, events, MT_REACTOR_MAX_EVENTS, ms);
+  if (n > 0) {
+    for (int i = 0; i < n; i++) {
+      int fd = events[i].fd;
+      if (fd == r->wake_pipe[0]) {
+        char drain[64];
+        while (read(r->wake_pipe[0], drain, sizeof(drain)) > 0) {}
+        *woke_out = 1;
+        continue;
+      }
+      short rev = events[i].revents;
+      if (rev & (POLLIN | POLLPRI | POLLERR | POLLHUP | POLLNVAL)) {
+        av_push(ready_av, newSViv(fd));
+        av_push(ready_av, newSViv(0));
+        count++;
+      }
+      if (rev & POLLOUT) {
+        av_push(ready_av, newSViv(fd));
+        av_push(ready_av, newSViv(1));
+        count++;
+      }
+    }
+  }
+#else /* MT_USE_POLL */
+  int need = r->io_count + 1;
+  if (need > r->pfds_cap) {
+    int ncap = r->pfds_cap ? r->pfds_cap : 64;
+    while (ncap < need) ncap *= 2;
+    struct pollfd *np = (struct pollfd *)realloc(r->pfds, (size_t)ncap * sizeof(struct pollfd));
+    if (!np) return 0;
+    r->pfds     = np;
+    r->pfds_cap = ncap;
+  }
+  int nfds = 0;
+  r->pfds[nfds].fd      = r->wake_pipe[0];
+  r->pfds[nfds].events  = POLLIN;
+  r->pfds[nfds].revents = 0;
+  nfds++;
+  for (int fd = 0; fd < r->io_cap; fd++) {
+    mt_io_watcher_t *w = &r->io[fd];
+    if (!w->active || !w->mode) continue;
+    short ev = 0;
+    if (w->mode & 1) ev |= POLLIN | POLLPRI;
+    if (w->mode & 2) ev |= POLLOUT;
+    r->pfds[nfds].fd      = fd;
+    r->pfds[nfds].events  = ev;
+    r->pfds[nfds].revents = 0;
+    nfds++;
+  }
+  int ms = (timeout <= 0.0) ? 0 : (int)(timeout * 1000.0) + 1;
+  int n = poll(r->pfds, (nfds_t)nfds, ms);
+  if (n > 0) {
+    if (r->pfds[0].revents & POLLIN) {
+      char drain[64];
+      while (read(r->wake_pipe[0], drain, sizeof(drain)) > 0) {}
+      *woke_out = 1;
+    }
+    for (int i = 1; i < nfds; i++) {
+      short rev = r->pfds[i].revents;
+      if (!rev) continue;
+      int fd = r->pfds[i].fd;
+      if (rev & (POLLIN | POLLPRI | POLLERR | POLLHUP | POLLNVAL)) {
+        av_push(ready_av, newSViv(fd));
+        av_push(ready_av, newSViv(0));
+        count++;
+      }
+      if (rev & POLLOUT) {
         av_push(ready_av, newSViv(fd));
         av_push(ready_av, newSViv(1));
         count++;

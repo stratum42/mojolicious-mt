@@ -5,12 +5,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#if defined(__ARM_NEON) || defined(__aarch64__)
-#  include <arm_neon.h>
-#  define MT_HAS_NEON 1
-#else
-#  define MT_HAS_NEON 0
-#endif
+#include "mt_simd.h"
 
 /* Lookup tables (const, read-only, zero mutable global state) */
 static const char MT_HEX_UPPER[16] = "0123456789ABCDEF";
@@ -74,35 +69,11 @@ static const int8_t MT_B64_DEC[256] = {
 };
 
 /* ============================================================================
- * xml_escape: NEON-accelerated scan for [&<>"']
+ * xml_escape: SIMD-accelerated scan for [&<>"']
  * ============================================================================ */
 
 static inline size_t mt_find_xml_special(const unsigned char *p, size_t len) {
-  size_t i = 0;
-#if MT_HAS_NEON
-  if (len >= 16) {
-    const uint8x16_t v_amp = vdupq_n_u8('&');
-    const uint8x16_t v_lt  = vdupq_n_u8('<');
-    const uint8x16_t v_gt  = vdupq_n_u8('>');
-    const uint8x16_t v_qt  = vdupq_n_u8('"');
-    const uint8x16_t v_ap  = vdupq_n_u8('\'');
-    for (; i + 16 <= len; i += 16) {
-      uint8x16_t v = vld1q_u8(p + i);
-      uint8x16_t m = vorrq_u8(
-        vorrq_u8(vceqq_u8(v, v_amp), vceqq_u8(v, v_lt)),
-        vorrq_u8(vceqq_u8(v, v_gt), vorrq_u8(vceqq_u8(v, v_qt), vceqq_u8(v, v_ap)))
-      );
-      if (vmaxvq_u8(m) != 0) {
-        break;
-      }
-    }
-  }
-#endif
-  for (; i < len; i++) {
-    unsigned char c = p[i];
-    if (c == '&' || c == '<' || c == '>' || c == '"' || c == '\'') return i;
-  }
-  return len;
+  return mt_simd_scan_xml_plain(p, len);
 }
 
 static SV *mt_xml_escape(pTHX_ SV *sv) {
@@ -159,38 +130,7 @@ static SV *mt_xml_escape(pTHX_ SV *sv) {
  * ============================================================================ */
 
 static inline size_t mt_find_url_escape(const unsigned char *p, size_t len) {
-  size_t i = 0;
-#if MT_HAS_NEON
-  if (len >= 16) {
-    const uint8x16_t v_A    = vdupq_n_u8('A');
-    const uint8x16_t v_a    = vdupq_n_u8('a');
-    const uint8x16_t v_0    = vdupq_n_u8('0');
-    const uint8x16_t v_26   = vdupq_n_u8(26);
-    const uint8x16_t v_10   = vdupq_n_u8(10);
-    const uint8x16_t v_dash = vdupq_n_u8('-');
-    const uint8x16_t v_dot  = vdupq_n_u8('.');
-    const uint8x16_t v_und  = vdupq_n_u8('_');
-    const uint8x16_t v_til  = vdupq_n_u8('~');
-    for (; i + 16 <= len; i += 16) {
-      uint8x16_t v = vld1q_u8(p + i);
-      uint8x16_t is_upper = vcltq_u8(vsubq_u8(v, v_A), v_26);
-      uint8x16_t is_lower = vcltq_u8(vsubq_u8(v, v_a), v_26);
-      uint8x16_t is_digit = vcltq_u8(vsubq_u8(v, v_0), v_10);
-      uint8x16_t is_sym   = vorrq_u8(
-        vorrq_u8(vceqq_u8(v, v_dash), vceqq_u8(v, v_dot)),
-        vorrq_u8(vceqq_u8(v, v_und),  vceqq_u8(v, v_til))
-      );
-      uint8x16_t ok = vorrq_u8(vorrq_u8(is_upper, is_lower), vorrq_u8(is_digit, is_sym));
-      if (vminvq_u8(ok) == 0) {
-        break;
-      }
-    }
-  }
-#endif
-  for (; i < len; i++) {
-    if (!MT_URL_UNRESERVED[p[i]]) return i;
-  }
-  return len;
+  return mt_simd_scan_url_plain(p, len);
 }
 
 static SV *mt_url_escape(pTHX_ SV *sv) {
@@ -240,24 +180,11 @@ static SV *mt_url_escape(pTHX_ SV *sv) {
 }
 
 /* ============================================================================
- * url_unescape: NEON-accelerated scan for '%'
+ * url_unescape: SIMD-accelerated scan for '%'
  * ============================================================================ */
 
 static inline size_t mt_find_pct(const unsigned char *p, size_t len) {
-  size_t i = 0;
-#if MT_HAS_NEON
-  if (len >= 16) {
-    const uint8x16_t v_pct = vdupq_n_u8('%');
-    for (; i + 16 <= len; i += 16) {
-      uint8x16_t v = vld1q_u8(p + i);
-      if (vmaxvq_u8(vceqq_u8(v, v_pct)) != 0) break;
-    }
-  }
-#endif
-  for (; i < len; i++) {
-    if (p[i] == '%') return i;
-  }
-  return len;
+  return mt_simd_find_byte(p, len, '%');
 }
 
 static SV *mt_url_unescape(pTHX_ SV *sv) {

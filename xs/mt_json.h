@@ -7,16 +7,7 @@
 #include <string.h>
 #include <math.h>
 
-#if defined(__ARM_NEON) || defined(__aarch64__)
-#  include <arm_neon.h>
-#  ifndef MT_HAS_NEON
-#    define MT_HAS_NEON 1
-#  endif
-#else
-#  ifndef MT_HAS_NEON
-#    define MT_HAS_NEON 0
-#  endif
-#endif
+#include "mt_simd.h"
 
 #define MT_JSON_MAX_DEPTH 512
 
@@ -82,37 +73,10 @@ static inline int mt_jbuf_puts(mt_jbuf_t *jb, const char *s, size_t n) {
   return 1;
 }
 
-/* ---- NEON-accelerated JSON string encoder ---- */
+/* ---- SIMD-accelerated JSON string encoder ---- */
 
 static inline size_t mt_json_scan_str(const unsigned char *p, size_t len, int is_utf8) {
-  size_t i = 0;
-#if MT_HAS_NEON
-  if (len >= 16) {
-    const uint8x16_t v_sp  = vdupq_n_u8(0x20);
-    const uint8x16_t v_qt  = vdupq_n_u8('"');
-    const uint8x16_t v_bs  = vdupq_n_u8('\\');
-    const uint8x16_t v_sl  = vdupq_n_u8('/');
-    const uint8x16_t v_hi  = vdupq_n_u8(0x80);
-    for (; i + 16 <= len; i += 16) {
-      uint8x16_t v = vld1q_u8(p + i);
-      uint8x16_t m = vorrq_u8(
-        vorrq_u8(vcltq_u8(v, v_sp), vceqq_u8(v, v_qt)),
-        vorrq_u8(vceqq_u8(v, v_bs), vceqq_u8(v, v_sl))
-      );
-      if (!is_utf8) {
-        m = vorrq_u8(m, vcgeq_u8(v, v_hi));
-      }
-      if (vmaxvq_u8(m) != 0) break;
-    }
-  }
-#endif
-  for (; i < len; i++) {
-    unsigned char c = p[i];
-    if (c < 0x20 || c == '"' || c == '\\' || c == '/' || (!is_utf8 && c >= 0x80)) {
-      return i;
-    }
-  }
-  return len;
+  return mt_simd_scan_json_enc(p, len, is_utf8);
 }
 
 static int mt_json_encode_str(mt_jbuf_t *jb, const unsigned char *p, size_t len, int is_utf8) {
@@ -508,28 +472,7 @@ static inline size_t mt_utf8_validate_seq(const unsigned char *p, const unsigned
 }
 
 static inline size_t mt_jdec_scan_plain(const unsigned char *p, size_t len) {
-  size_t i = 0;
-#if MT_HAS_NEON
-  if (len >= 16) {
-    const uint8x16_t v_sp = vdupq_n_u8(0x20);
-    const uint8x16_t v_qt = vdupq_n_u8('"');
-    const uint8x16_t v_bs = vdupq_n_u8('\\');
-    const uint8x16_t v_hi = vdupq_n_u8(0x80);
-    for (; i + 16 <= len; i += 16) {
-      uint8x16_t v = vld1q_u8(p + i);
-      uint8x16_t m = vorrq_u8(
-        vorrq_u8(vcltq_u8(v, v_sp), vceqq_u8(v, v_qt)),
-        vorrq_u8(vceqq_u8(v, v_bs), vcgeq_u8(v, v_hi))
-      );
-      if (vmaxvq_u8(m) != 0) break;
-    }
-  }
-#endif
-  for (; i < len; i++) {
-    unsigned char c = p[i];
-    if (c < 0x20 || c == '"' || c == '\\' || c >= 0x80) return i;
-  }
-  return len;
+  return mt_simd_scan_json_dec(p, len);
 }
 
 /* Decode JSON string starting right after opening '"' */

@@ -43,6 +43,14 @@ use overload '""' => sub { 'overloaded-str' }, fallback => 1;
 
 package main;
 
+subtest 'simd_tier and reactor_backend introspection' => sub {
+  my $tier = Mojo::MT::Accel::simd_tier();
+  like $tier, qr/^(?:avx2|sse2|neon|vsx|vx|scalar)$/, "simd_tier() returns valid tier ($tier)";
+
+  my $backend = Mojo::MT::Accel::reactor_backend();
+  like $backend, qr/^(?:kqueue|epoll|pollset|poll)$/, "reactor_backend() returns valid backend ($backend)";
+};
+
 subtest 'xml_escape parity' => sub {
   my @cases = (
     '',

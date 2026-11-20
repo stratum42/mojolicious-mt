@@ -27,7 +27,7 @@ WriteMakefile(
   INC           => '-I.',
   OBJECT        => 'KeyDB$(OBJ_EXT)',
   depend        => {
-    'KeyDB.c' => 'mt_resp.h',
+    'KeyDB.c' => 'mt_resp.h mt_resp_simd.h',
   },
   @extra,
 );

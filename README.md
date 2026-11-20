@@ -41,11 +41,14 @@ Backward compatibility with stock Perl is a hard requirement of this fork:
   (`./myapp.pl mt -w 8 -l http://127.0.0.1:8080`) mirroring the familiar
   `daemon` and `prefork` flags.
 - `Mojo::Reactor::MT` (`lib/Mojo/Reactor/MT.pm`): A thread-safe C event reactor
-  backed by `kqueue` (macOS/BSD) or `epoll` (Linux), with a C binary min-heap
-  timer queue and cross-thread wakeups via `EVFILT_USER` / `eventfd`.
+  backed by `kqueue` (macOS/BSD), `epoll` (Linux), `pollset` (AIX), or POSIX
+  `poll` (fallback for IBM i PASE, z/OS USS, Solaris, and other POSIX systems),
+  with a C binary min-heap timer queue and cross-thread wakeups.
 - `Mojo::MT::Accel` (`xs/`): An optional thread-safe (`PERL_XS_THREADSAFE=1`)
-  XS extension with ARM64 NEON fast paths and portable C fallbacks for
-  HTTP/1.1 request/header parsing and response serialization, `Mojo::JSON`
+  XS extension with multi-architecture SIMD fast paths (`amd64` AVX2/SSE2,
+  `arm64` NEON, POWER VSX/AltiVec LE/BE, `s390x` VX) and an exact scalar twin
+  (also selected under `PERL_FORCE_SCALAR` or EBCDIC) for HTTP/1.1
+  request/header parsing and response serialization, `Mojo::JSON`
   encode/decode, `Mojo::Util` string helpers (`xml_escape`, `url_escape`,
   `url_unescape`, `b64_encode`, `b64_decode`), and `Mojo::Reactor::MT`.  Any
   edge case (such as obs-fold headers, UTF-8 header keys, or invalid JSON
@@ -86,8 +89,11 @@ knowing upfront:
   non-Linux platforms, `:async` is only used for files of at least 256 KiB,
   since plain `sysread` and `stat` are faster for small static assets there.
 - **Portability of XS extensions**: Both `xs/` and `xs-keydb/` are optional.
-  NEON intrinsics are enabled conditionally on ARM64; other architectures use
-  the portable C paths, and stock Perl skips the XS extensions altogether.
+  `xs/mt_simd.h` selects `amd64` AVX2/SSE2, `arm64` NEON, POWER VSX/AltiVec
+  (LE and BE), `s390x` VX, or the scalar twin at compile time (and always uses
+  the scalar twin under `PERL_FORCE_SCALAR` or EBCDIC). `Mojo::Reactor::MT`
+  selects `kqueue`, `epoll`, AIX `pollset`, or POSIX `poll`. Stock Perl skips
+  the XS extensions altogether.
 
 ## Building the Optional XS Extensions
 

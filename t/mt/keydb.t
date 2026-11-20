@@ -15,6 +15,12 @@ my $HAS_XS = Mojo::MT::KeyDB::HAS_KEYDB_XS;
 # ============================================================================
 
 subtest 'RESP2/RESP3 encoding & decoding unit tests' => sub {
+  if ($HAS_XS) {
+    my $tier = Mojo::MT::KeyDB::XS::simd_tier();
+    like $tier, qr/\A(?:avx2|sse2|neon|vsx|s390x_vx|scalar)\z/,
+      "XS simd_tier() reports a supported tier ($tier)";
+  }
+
   my @encode_cases = (
     ['PING'],
     ['SET', 'mykey', 'myvalue'],

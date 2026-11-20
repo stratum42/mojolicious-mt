@@ -18,16 +18,19 @@ if (!-d "$Config{archlibexp}/CORE") {
   }
 }
 
+my @define = ('-DPERL_XS_THREADSAFE=1');
+push @define, '-DPERL_FORCE_SCALAR=1' if $ENV{PERL_FORCE_SCALAR};
+
 WriteMakefile(
   NAME          => 'Mojo::MT::Accel',
   VERSION_FROM  => 'lib/Mojo/MT/Accel.pm',
   ABSTRACT_FROM => 'lib/Mojo/MT/Accel.pm',
-  DEFINE        => '-DPERL_XS_THREADSAFE=1',
+  DEFINE        => join(' ', @define),
   OPTIMIZE      => '-O3',
   INC           => '-I.',
   OBJECT        => 'Accel$(OBJ_EXT)',
   depend        => {
-    'Accel.c' => 'mt_reactor.h mt_http.h mt_json.h mt_util.h',
+    'Accel.c' => 'mt_simd.h mt_reactor.h mt_http.h mt_json.h mt_util.h',
   },
   @extra,
 );
