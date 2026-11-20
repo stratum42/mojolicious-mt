@@ -1,111 +1,129 @@
+# mojolicious-mt
 
-<p align="center">
-  <a href="https://mojolicious.org">
-    <img src="https://raw.github.com/mojolicious/mojo/main/lib/Mojolicious/resources/public/mojo/logo.png?raw=true" style="margin: 0 auto;">
-  </a>
-</p>
+`mojolicious-mt` is an experimental community fork of
+[Mojolicious](https://mojolicious.org) built to explore what happens when a
+Mojolicious application runs on
+[`perl5-mt`](https://github.com/stratum42/perl5-mt)'s shared-memory worker
+threads and optional thread-safe XS extensions, while keeping existing
+Mojolicious code and stock Perl compatibility intact.
 
- [![](https://github.com/mojolicious/mojo/workflows/linux/badge.svg)](https://github.com/mojolicious/mojo/actions) [![](https://github.com/mojolicious/mojo/workflows/macos/badge.svg)](https://github.com/mojolicious/mojo/actions) [![](https://github.com/mojolicious/mojo/workflows/windows/badge.svg)](https://github.com/mojolicious/mojo/actions)
+First and foremost, this work rests on the shoulders of upstream
+[Mojolicious](https://mojolicious.org) (Sebastian Riedel and the Mojolicious
+contributors) and [Perl 5](https://www.perl.org) (Larry Wall and the Perl
+community).  Mojolicious's clean separation between `Mojo::Reactor`,
+`Mojo::IOLoop`, `Mojo::Server`, and HTTP parsing made it possible to experiment
+with a single-process multi-worker runtime without distorting the framework's
+public API.  The original upstream Mojolicious README is preserved in
+[UPSTREAM_README.md](UPSTREAM_README.md).
 
-  Mojolicious is a fresh take on **Perl** web development, based on years of experience developing the Catalyst
-  framework, and utilizing the latest web standards and technologies. You can get started with your project quickly,
-  with a framework that grows with your needs.
+## Compatibility With Stock Perl
 
-  The Mojo stack provides a consistent set of components that can be used in any project. The guides cover most aspects
-  of using the framework and the components have comprehensive reference documentation. Mojolicious is a real-time web
-  framework, which allows a new class of web applications using WebSockets and having long-running requests without
-  blocking.
+Backward compatibility with stock Perl is a hard requirement of this fork:
 
-  Join us now, and be a part of a friendly and knowledgeable community of developers!
+- On stock Perl, the compile-time constants in `Mojo::MT` (`HAS_MT`,
+  `HAS_MT_ACCEL`, `HAS_MT_FIBER`, `HAS_MT_ASYNC_IO`, `HAS_MT_SHARED_HASH`) all
+  fold to `0`, and every module falls back to Mojolicious's pure-Perl
+  implementations (and `Mojo::Server::MT` falls back to `Mojo::Server::Daemon`).
+- Under `perl5-mt`, you can disable the native paths at runtime for comparison
+  or debugging with `MOJO_NO_MT_ACCEL=1` (disables `Mojo::MT::Accel` while
+  keeping worker threads) or `MOJO_NO_MT=1` (disables all `perl5-mt` paths).
 
-## Features
+## What This Fork Adds
 
-  * Most [popular](https://metacpan.org/favorite/leaderboard) distribution on **CPAN**.
-  * An amazing **real-time web framework**, allowing you to easily grow single file prototypes into well-structured MVC
-    web applications.
-    * Everything you need to build cloud-native web applications for state of the art container environments.
-    * Powerful out of the box with RESTful routes, plugins, commands, Perl-ish templates, content negotiation, session
-      management, form validation, testing framework, static file server, CGI/[PSGI](http://plackperl.org) detection,
-      first class Unicode support and much more for you to discover.
-  * A powerful **web development toolkit**, that you can use for all kinds of applications, independently of the web
-    framework.
-    * Full stack HTTP and WebSocket client/server implementation with IPv6, TLS, SNI, IDNA, HTTP/SOCKS5 proxy, UNIX
-      domain socket, Comet (long polling), Server-Sent Events (SSE), Promises/A+, async/await, keep-alive, connection
-      pooling, timeout, cookie, multipart, and gzip compression support.
-    * Built-in non-blocking I/O web server, supporting multiple event loops as well as optional pre-forking and hot
-      deployment, perfect for building highly scalable web services.
-    * JSON and HTML/XML parser with CSS selector support.
-  * Very clean, portable and object-oriented pure-Perl API with no hidden magic and no requirements besides Perl 5.26.0
-    (versions as old as 5.16.0 can be used too, but may require additional CPAN modules to be installed)
-  * Also available for [JavaScript](https://mojojs.org).
-  * Fresh code based upon years of experience developing [Catalyst](http://catalyst.perl.org), free and open source.
-  * Hundreds of 3rd party [extensions](https://metacpan.org/requires/distribution/Mojolicious) and high quality spin-off
-    projects like the [Minion](https://metacpan.org/pod/Minion) job queue.
+- `Mojo::MT` (`lib/Mojo/MT.pm`): Compile-time feature detection for `perl5-mt`
+  and `Mojo::MT::Accel`, plus `prepare_for_freeze()` to clear boot-time
+  singletons and weakref registries before `MT::Image::freeze()`.
+- `Mojo::Server::MT` (`lib/Mojo/Server/MT.pm`): A single-process multi-worker
+  HTTP/1.1 and WebSocket server that preloads modules, seals the compiled
+  interpreter with `MT::Image::freeze()`, and runs one `Mojo::IOLoop` per
+  `MT::Worker` thread.
+- `Mojolicious::Command::mt` (`lib/Mojolicious/Command/mt.pm`): CLI entry point
+  (`./myapp.pl mt -w 8 -l http://127.0.0.1:8080`) mirroring the familiar
+  `daemon` and `prefork` flags.
+- `Mojo::Reactor::MT` (`lib/Mojo/Reactor/MT.pm`): A thread-safe C event reactor
+  backed by `kqueue` (macOS/BSD) or `epoll` (Linux), with a C binary min-heap
+  timer queue and cross-thread wakeups via `EVFILT_USER` / `eventfd`.
+- `Mojo::MT::Accel` (`xs/`): An optional thread-safe (`PERL_XS_THREADSAFE=1`)
+  XS extension with ARM64 NEON fast paths and portable C fallbacks for
+  HTTP/1.1 request/header parsing and response serialization, `Mojo::JSON`
+  encode/decode, `Mojo::Util` string helpers (`xml_escape`, `url_escape`,
+  `url_unescape`, `b64_encode`, `b64_decode`), and `Mojo::Reactor::MT`.  Any
+  edge case (such as obs-fold headers, UTF-8 header keys, or invalid JSON
+  diagnostics) delegates back to pure Perl so behavior matches upstream.
+- `Mojo::MT::KeyDB` (`lib/Mojo/MT/KeyDB.pm`, `xs-keydb/`): A thread-safe
+  RESP2/RESP3 client for KeyDB and Redis with per-worker `MY_CXT` persistent
+  TCP/Unix sockets, an optional XS codec (`Mojo::MT::KeyDB::XS`), and a
+  pure-Perl fallback.
+- `Mojo::MT::SharedCache` (`lib/Mojo/MT/SharedCache.pm`): A small key-value
+  wrapper over `MT::SharedHash` for sharing scalar values across worker threads
+  without serialization (falls back to a process-local hash on stock Perl).
+- `Mojo::MT::Fiber` (`lib/Mojo/MT/Fiber.pm`): Convenience helpers
+  (`run_fibers`, `async_slurp`, `async_slurp_many`, `yield`, `pass`) over
+  `MT::Fiber` and the `:async` PerlIO layer.
 
-## Installation
+## Trade-offs and Platform Notes
 
-  All you need is a one-liner, it takes less than a minute.
+This is an experimental runtime model, and a few practical trade-offs are worth
+knowing upfront:
 
-    $ curl -L https://cpanmin.us | perl - -M https://cpan.metacpan.org -n Mojolicious
+- **Sealed boot image constraints**: `MT::Image::freeze()` marks the boot-time
+  interpreter read-only.  Modules that mutate package-level lexicals or
+  `Hash::Util::FieldHash` registries after freeze will trap in worker threads.
+  `Mojo::Server::MT` mitigates this by preloading core modules, running
+  `Mojo::MT::prepare_for_freeze()`, instantiating the application per worker,
+  and storing per-worker caches in `our` globals (which `perl5-mt` isolates per
+  worker via GP indirection).  Third-party CPAN modules that keep mutable C
+  globals without `PERL_XS_THREADSAFE=1` are not safe to call directly inside
+  worker threads unless isolated by `perl5-mt`'s XS compartment layer.
+- **Linux vs macOS/BSD socket accepts**: On Linux, each worker binds its own
+  `SO_REUSEPORT` listen socket so the kernel distributes incoming connections
+  across per-worker accept queues.  On macOS and other non-Linux systems,
+  `SO_REUSEPORT` does not load-balance TCP accepts across distinct sockets, so
+  `Mojo::Server::MT` binds one shared listen socket per URL and shares the file
+  descriptor across workers.
+- **`:async` file I/O**: `Mojo::Asset::File` uses `MT::IO` (`:async` and
+  `MT::IO::stat`) for all file reads on Linux (`io_uring`).  On macOS and other
+  non-Linux platforms, `:async` is only used for files of at least 256 KiB,
+  since plain `sysread` and `stat` are faster for small static assets there.
+- **Portability of XS extensions**: Both `xs/` and `xs-keydb/` are optional.
+  NEON intrinsics are enabled conditionally on ARM64; other architectures use
+  the portable C paths, and stock Perl skips the XS extensions altogether.
 
-  We recommend the use of a [Perlbrew](http://perlbrew.pl) environment.
+## Building the Optional XS Extensions
 
-## Getting Started
+Build `xs/` (`Mojo::MT::Accel`) and `xs-keydb/` (`Mojo::MT::KeyDB::XS`) against
+your `perl5-mt` binary (installed or in an uninstalled source tree):
 
-  These three lines are a whole web application.
+```sh
+PERL5_MT=/path/to/perl5-mt/perl
+PERL5_MT_LIB=/path/to/perl5-mt/lib
 
-```perl
-use Mojolicious::Lite;
-
-get '/' => {text => 'I ♥ Mojolicious!'};
-
-app->start;
+(cd xs && "$PERL5_MT" "-I$PERL5_MT_LIB" Makefile.PL && make)
+(cd xs-keydb && "$PERL5_MT" "-I$PERL5_MT_LIB" Makefile.PL && make)
 ```
 
-  To run the example with the built-in development web server, just put the code into a file and start it with `morbo`.
+If building against an uninstalled `perl5-mt` tree located elsewhere, you can
+also point `PERL5_MT_SRC=/path/to/perl5-mt` before running `Makefile.PL`.
 
-    $ morbo hello.pl
-    Web application available at http://127.0.0.1:3000
+## Running Tests
 
-  Test it with any HTTP client you prefer.
+Run the `t/mt/*.t` suite against `perl5-mt` with the built XS extensions:
 
-    $ curl http://127.0.0.1:3000/
-    I ♥ Mojolicious!
-
-## Duct tape for the HTML5 web
-
-  Use all the latest Perl and HTML features in beautiful single file prototypes like this one, and
-  [grow](https://docs.mojolicious.org/Mojolicious/Guides/Growing#Differences) them easily into well-structured
-  **Model-View-Controller** web applications.
-
-```perl
-use Mojolicious::Lite -signatures;
-
-# Render template "index.html.ep" from the DATA section
-get '/' => sub ($c) {
-  $c->render(template => 'index');
-};
-
-# WebSocket service used by the template to extract the title from a website
-websocket '/title' => sub ($c) {
-  $c->on(message => sub ($c, $msg) {
-    my $title = $c->ua->get($msg)->result->dom->at('title')->text;
-    $c->send($title);
-  });
-};
-
-app->start;
-__DATA__
-
-@@ index.html.ep
-% my $url = url_for 'title';
-<script>
-  const ws = new WebSocket('<%= $url->to_abs %>');
-  ws.onmessage = function (event) { document.body.innerHTML += event.data };
-  ws.onopen    = function (event) { ws.send('https://mojolicious.org') };
-</script>
+```sh
+/path/to/perl5-mt/perl \
+  -I/path/to/perl5-mt/lib \
+  -Ixs/blib/lib -Ixs/blib/arch \
+  -Ixs-keydb/blib/lib -Ixs-keydb/blib/arch \
+  -Ilib \
+  -MTest::Harness -e 'runtests(@ARGV)' t/mt/*.t
 ```
 
-## Want to know more?
+To verify stock Perl compatibility, run the same tests (plus the upstream
+`t/mojo/*.t` and `t/mojolicious/*.t` suites) with your system `perl -Ilib`.
 
-  Take a look at our excellent [documentation](https://docs.mojolicious.org)!
+## Benchmarks
+
+Reproducible benchmark harnesses and measurement scripts are kept in the
+separate
+[`mojolicious-mt-bench`](https://github.com/stratum42/mojolicious-mt-bench)
+repository so the framework tree stays focused on library code and tests.
